@@ -623,7 +623,9 @@ export function PixelLabPanel({ open, onClose, onAssetsChanged, projectAssets = 
                 <input
                   className="win-pop-inp"
                   type="password"
-                  placeholder="API token"
+                  placeholder={
+                    hasKey ? "•••• key on file — paste to replace" : "API token"
+                  }
                   value={keyInput}
                   onChange={(e) => setKeyInput(e.target.value)}
                   autoComplete="off"

@@ -122,6 +122,21 @@ function GeminiModelMessage({ text, turnIndex, copyFlashKey, onCopy, onSendToEdi
 }
 
 const GEMINI_MODELS: { id: string; label: string }[] = [
+  { id: "gemini-3-flash-preview", label: "Gemini 3 Flash" },
+  { id: "gemini-3.1-flash-lite-preview", label: "Gemini 3.1 Flash-Lite" },
+  { id: "gemini-3.1-pro-preview", label: "Gemini 3.1 Pro" },
+  {
+    id: "gemini-3.1-pro-preview-customtools",
+    label: "Gemini 3.1 Pro (custom tools)",
+  },
+  {
+    id: "gemini-3-pro-image-preview",
+    label: "Gemini 3 Pro Image (Nano Banana Pro)",
+  },
+  {
+    id: "gemini-3.1-flash-image-preview",
+    label: "Gemini 3.1 Flash Image",
+  },
   { id: "gemini-2.5-flash", label: "Gemini 2.5 Flash" },
   { id: "gemini-2.5-pro", label: "Gemini 2.5 Pro" },
   { id: "gemini-1.5-flash", label: "Gemini 1.5 Flash" },

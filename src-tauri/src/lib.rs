@@ -370,6 +370,14 @@ fn run_inner(app: &tauri::AppHandle, state: &Arc<RunnerState>) -> Result<(), Str
     .stdout(Stdio::piped())
     .stderr(Stdio::piped());
 
+  // Windows: `python.exe` is a console-subsystem process; without this, the OS shows a new terminal
+  // window when Run spawns it from our GUI app (macOS does not). Stdio pipes still work.
+  #[cfg(windows)]
+  {
+    use std::os::windows::process::CommandExt;
+    cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+  }
+
   let shared = SharedChild::spawn(&mut cmd).map_err(|e| e.to_string())?;
   let out = shared
     .take_stdout()
@@ -1163,7 +1171,14 @@ pub struct GeminiTurn {
 }
 
 // 2.0 is no longer available to new API key holders; use 2.5+.
+// Gemini 3.x (Google AI model docs). Live / TTS models use other API surfaces, not streamGenerateContent.
 const GEMINI_MODEL_ALLOWLIST: &[&str] = &[
+  "gemini-3-flash-preview",
+  "gemini-3.1-flash-lite-preview",
+  "gemini-3.1-pro-preview",
+  "gemini-3.1-pro-preview-customtools",
+  "gemini-3-pro-image-preview",
+  "gemini-3.1-flash-image-preview",
   "gemini-2.5-flash",
   "gemini-2.5-pro",
   "gemini-1.5-flash",
