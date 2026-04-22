@@ -1,0 +1,36 @@
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family: Tahoma, "MS Sans Serif", "Segoe UI", sans-serif;
+  font-size: 11px;
+  color: #000;
+  background: #c0c0c0;
+  overflow: hidden;
+  user-select: none;
+}
+
+#root {
+  min-height: 0;
+}
+
+input,
+button,
+textarea {
+  font: inherit;
+}
+
+/* Allow text selection in console placeholder (later: full console) */
+.console-body {
+  user-select: text;
+}
