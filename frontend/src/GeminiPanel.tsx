@@ -12,6 +12,7 @@ import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
 
 type Turn = { role: "user" | "model"; text: string };
+type AiProvider = "gemini" | "gpt";
 
 /** Split on GFM-style ``` ` fences (same pattern as most LLM outputs). */
 function parseMarkdownFences(s: string): { kind: "text" | "code"; value: string; info: string }[] {
@@ -42,16 +43,17 @@ type ModelMsgProps = {
   onCopy: (t: string, key: string) => void;
   onSendToEditor: ((key: string, code: string) => void) | undefined;
   editorToEditorFlash: string | null;
+  assistantLabel: string;
 };
 
-function GeminiModelMessage({ text, turnIndex, copyFlashKey, onCopy, onSendToEditor, editorToEditorFlash }: ModelMsgProps) {
+function GeminiModelMessage({ text, turnIndex, copyFlashKey, onCopy, onSendToEditor, editorToEditorFlash, assistantLabel }: ModelMsgProps) {
   const segments = useMemo(() => parseMarkdownFences(text), [text]);
   const hasFencedCode = segments.some((s) => s.kind === "code");
 
   return (
     <>
       <div className="gemini-msg-hdr">
-        <span className="gemini-msg-who">Gemini</span>
+        <span className="gemini-msg-who">{assistantLabel}</span>
         <div className="gemini-msg-actions">
           <button
             type="button"
@@ -119,12 +121,40 @@ function GeminiModelMessage({ text, turnIndex, copyFlashKey, onCopy, onSendToEdi
   );
 }
 
-const MODELS: { id: string; label: string }[] = [
+const GEMINI_MODELS: { id: string; label: string }[] = [
   { id: "gemini-2.5-flash", label: "Gemini 2.5 Flash" },
   { id: "gemini-2.5-pro", label: "Gemini 2.5 Pro" },
   { id: "gemini-1.5-flash", label: "Gemini 1.5 Flash" },
   { id: "gemini-1.5-pro", label: "Gemini 1.5 Pro" },
 ];
+
+/** Picker + labels; any `gpt-*` id from a saved file is passed through and validated in Rust. */
+const GPT_MODELS: { id: string; label: string }[] = [
+  { id: "gpt-5.4", label: "GPT-5.4" },
+  { id: "gpt-5.4-pro", label: "GPT-5.4 pro" },
+  { id: "gpt-5.4-mini", label: "GPT-5.4 mini" },
+  { id: "gpt-5.4-nano", label: "GPT-5.4 nano" },
+  { id: "gpt-5.2", label: "GPT-5.2" },
+  { id: "gpt-5.1", label: "GPT-5.1" },
+  { id: "gpt-5", label: "GPT-5" },
+  { id: "gpt-5-mini", label: "GPT-5 mini" },
+  { id: "gpt-5-nano", label: "GPT-5 nano" },
+  { id: "gpt-4o", label: "GPT-4o" },
+  { id: "gpt-4o-mini", label: "GPT-4o mini" },
+  { id: "gpt-4-turbo", label: "GPT-4 Turbo" },
+  { id: "gpt-3.5-turbo", label: "GPT-3.5 Turbo" },
+];
+
+function normalizeModel(p: AiProvider, model: string): string {
+  const list = p === "gemini" ? GEMINI_MODELS : GPT_MODELS;
+  if (p === "gpt") {
+    if (list.some((m) => m.id === model)) return model;
+    const t = model.trim();
+    if (/^gpt-[0-9a-z._-]+$/i.test(t)) return t;
+    return list[0].id;
+  }
+  return list.some((m) => m.id === model) ? model : list[0].id;
+}
 
 type ChatListItem = { id: string; title: string; updated_at: number };
 
@@ -216,7 +246,8 @@ type Props = {
 };
 
 export function GeminiPanel({ open, onClose, onSendCodeToEditor }: Props) {
-  const [model, setModel] = useState(MODELS[0].id);
+  const [provider, setProvider] = useState<AiProvider>("gemini");
+  const [model, setModel] = useState(GEMINI_MODELS[0].id);
   const [keyInput, setKeyInput] = useState("");
   const [hasKey, setHasKey] = useState(false);
   const [chats, setChats] = useState<ChatListItem[]>([]);
@@ -233,56 +264,83 @@ export function GeminiPanel({ open, onClose, onSendCodeToEditor }: Props) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const streamAccRef = useRef("");
   const lastUserTextRef = useRef("");
-  const stateRef = useRef({ activeChatId: null as string | null, model: MODELS[0].id, chatTitle: "New chat" });
+  const stateRef = useRef({
+    activeChatId: null as string | null,
+    model: GEMINI_MODELS[0].id,
+    chatTitle: "New chat",
+    provider: "gemini" as AiProvider,
+  });
   const sessionInited = useRef(false);
+  /** Bumped on every chat / provider / new-chat navigation; aborts in-flight work after any `await` so out-of-order completion can’t clobber the UI. */
+  const chatNavGenRef = useRef(0);
+  const nextChatNavGen = () => {
+    chatNavGenRef.current += 1;
+    return chatNavGenRef.current;
+  };
+  const isStaleChatNav = (g: number) => g !== chatNavGenRef.current;
+
+  const modelsForProvider = useMemo(
+    () => (provider === "gemini" ? GEMINI_MODELS : GPT_MODELS),
+    [provider],
+  );
 
   const refreshKeyState = useCallback(async () => {
     if (!isTauri()) return;
     try {
-      const ok = (await invoke("gemini_key_configured")) as boolean;
+      const ok =
+        provider === "gemini"
+          ? ((await invoke("gemini_key_configured")) as boolean)
+          : ((await invoke("openai_key_configured")) as boolean);
       setHasKey(!!ok);
     } catch {
       setHasKey(false);
     }
-  }, []);
+  }, [provider]);
 
-  const refreshChats = useCallback(async () => {
-    if (!isTauri()) return;
-    const list = (await invoke("list_gemini_chats")) as ChatListItem[];
-    setChats(list);
-  }, []);
+  const refreshChats = useCallback(
+    async (forProvider?: AiProvider) => {
+      if (!isTauri()) return;
+      const pr = forProvider ?? provider;
+      const list = (await invoke("list_gemini_chats", { provider: pr })) as ChatListItem[];
+      setChats(list);
+    },
+    [provider],
+  );
 
   useEffect(() => {
     void refreshKeyState();
   }, [refreshKeyState]);
 
+  const assistantLabel = provider === "gemini" ? "Gemini" : "GPT";
+
   // Load or create a saved session — first time the panel is opened (avoids work until needed).
   useEffect(() => {
     if (!isTauri() || !open) return;
     if (sessionInited.current) return;
-    sessionInited.current = true;
     let cancelled = false;
     void (async () => {
       try {
-        let list = (await invoke("list_gemini_chats")) as ChatListItem[];
+        let list = (await invoke("list_gemini_chats", { provider: "gemini" })) as ChatListItem[];
         if (list.length === 0) {
-          await invoke("new_gemini_chat");
-          list = (await invoke("list_gemini_chats")) as ChatListItem[];
+          await invoke("new_gemini_chat", { provider: "gemini" });
+          list = (await invoke("list_gemini_chats", { provider: "gemini" })) as ChatListItem[];
         }
         if (cancelled) return;
         setChats(list);
         const first = list[0];
         if (first) {
-          const f = (await invoke("load_gemini_chat", { id: first.id })) as {
+          const f = (await invoke("load_gemini_chat", { id: first.id, provider: "gemini" })) as {
             id: string;
             title: string;
+            provider?: string;
             model: string;
             turns: { role: string; text: string }[];
           };
           if (cancelled) return;
+          setProvider("gemini");
           setActiveChatId(f.id);
           setChatTitle(f.title);
-          setModel(f.model);
+          setModel(normalizeModel("gemini", f.model));
           setTurns(
             f.turns.map((t) => ({
               role: t.role === "model" ? "model" : "user",
@@ -290,10 +348,13 @@ export function GeminiPanel({ open, onClose, onSendCodeToEditor }: Props) {
             })),
           );
         }
+        if (!cancelled) {
+          sessionInited.current = true;
+        }
       } catch (e) {
         if (!cancelled) setErr(String(e));
       } finally {
-        if (!cancelled) setSessionReady(true);
+        setSessionReady(true);
       }
     })();
     return () => {
@@ -302,8 +363,8 @@ export function GeminiPanel({ open, onClose, onSendCodeToEditor }: Props) {
   }, [open]);
 
   useEffect(() => {
-    stateRef.current = { activeChatId, model, chatTitle };
-  }, [activeChatId, model, chatTitle]);
+    stateRef.current = { activeChatId, model, chatTitle, provider };
+  }, [activeChatId, model, chatTitle, provider]);
 
   useEffect(() => {
     if (!open) return;
@@ -318,33 +379,45 @@ export function GeminiPanel({ open, onClose, onSendCodeToEditor }: Props) {
       const d = smartTitle(turns);
       if (d) title = d;
     }
+    const m = normalizeModel(provider, model);
+    if (m !== model) {
+      setModel(m);
+    }
     await invoke("save_gemini_conversation", {
       id: activeChatId,
-      model,
+      provider,
+      model: m,
       title,
       turns: turnPayload(turns),
     });
     if (title !== chatTitle) setChatTitle(title);
     await refreshChats();
-  }, [activeChatId, model, chatTitle, turns, refreshChats]);
+  }, [activeChatId, provider, model, chatTitle, turns, refreshChats]);
 
   const openChat = useCallback(
     async (id: string) => {
-      if (!isTauri() || !sessionReady) return;
-      if (sending) return;
+      if (!isTauri() || !sessionReady || sending) return;
       if (id === activeChatId) return;
+      const g = nextChatNavGen();
       setErr(null);
       try {
         await saveCurrentConv();
-        const f = (await invoke("load_gemini_chat", { id })) as {
+        if (isStaleChatNav(g)) {
+          return;
+        }
+        const f = (await invoke("load_gemini_chat", { id, provider })) as {
           id: string;
           title: string;
+          provider?: string;
           model: string;
           turns: { role: string; text: string }[];
         };
+        if (isStaleChatNav(g)) {
+          return;
+        }
         setActiveChatId(f.id);
         setChatTitle(f.title);
-        setModel(f.model);
+        setModel(normalizeModel(provider, f.model));
         setTurns(
           f.turns.map((t) => ({
             role: t.role === "model" ? "model" : "user",
@@ -354,49 +427,78 @@ export function GeminiPanel({ open, onClose, onSendCodeToEditor }: Props) {
         setDraft("");
         await refreshChats();
       } catch (e) {
-        setErr(String(e));
+        if (!isStaleChatNav(g)) {
+          setErr(String(e));
+        }
       }
     },
-    [activeChatId, sessionReady, sending, saveCurrentConv, refreshChats],
+    [activeChatId, provider, sessionReady, sending, saveCurrentConv, refreshChats],
   );
 
   const startNewChat = useCallback(async () => {
     if (!isTauri() || !sessionReady || sending) return;
+    const g = nextChatNavGen();
     setErr(null);
     try {
       await saveCurrentConv();
-      const id = (await invoke("new_gemini_chat")) as string;
+      if (isStaleChatNav(g)) {
+        return;
+      }
+      const id = (await invoke("new_gemini_chat", { provider })) as string;
+      if (isStaleChatNav(g)) {
+        return;
+      }
       await refreshChats();
+      if (isStaleChatNav(g)) {
+        return;
+      }
       setActiveChatId(id);
       setChatTitle("New chat");
-      setModel(MODELS[0].id);
+      setModel((provider === "gemini" ? GEMINI_MODELS : GPT_MODELS)[0].id);
       setTurns([]);
       setDraft("");
     } catch (e) {
-      setErr(String(e));
+      if (!isStaleChatNav(g)) {
+        setErr(String(e));
+      }
     }
-  }, [sessionReady, sending, saveCurrentConv, refreshChats]);
+  }, [sessionReady, sending, saveCurrentConv, refreshChats, provider]);
 
   const removeChat = useCallback(
     async (id: string) => {
       if (!isTauri() || sending) return;
       if (!window.confirm("Delete this chat? This cannot be undone.")) return;
+      const g = nextChatNavGen();
+      const wasActive = id === activeChatId;
       setErr(null);
       try {
-        await invoke("delete_gemini_chat_file", { id });
+        await invoke("delete_gemini_chat_file", { id, provider });
+        if (isStaleChatNav(g)) {
+          return;
+        }
         await refreshChats();
-        const list = (await invoke("list_gemini_chats")) as ChatListItem[];
-        if (id === activeChatId) {
+        if (isStaleChatNav(g)) {
+          return;
+        }
+        const list = (await invoke("list_gemini_chats", { provider })) as ChatListItem[];
+        if (isStaleChatNav(g)) {
+          return;
+        }
+        if (wasActive) {
           if (list[0]) {
-            const f = (await invoke("load_gemini_chat", { id: list[0].id })) as {
+            const f = (await invoke("load_gemini_chat", { id: list[0].id, provider })) as {
               id: string;
               title: string;
+              provider?: string;
               model: string;
               turns: { role: string; text: string }[];
             };
+            if (isStaleChatNav(g)) {
+              return;
+            }
             setActiveChatId(f.id);
             setChatTitle(f.title);
-            setModel(f.model);
+            setModel(normalizeModel(provider, f.model));
             setTurns(
               f.turns.map((t) => ({
                 role: t.role === "model" ? "model" : "user",
@@ -405,20 +507,28 @@ export function GeminiPanel({ open, onClose, onSendCodeToEditor }: Props) {
             );
             setDraft("");
           } else {
-            const nid = (await invoke("new_gemini_chat")) as string;
+            const nid = (await invoke("new_gemini_chat", { provider })) as string;
+            if (isStaleChatNav(g)) {
+              return;
+            }
             await refreshChats();
+            if (isStaleChatNav(g)) {
+              return;
+            }
             setActiveChatId(nid);
             setChatTitle("New chat");
-            setModel(MODELS[0].id);
+            setModel((provider === "gemini" ? GEMINI_MODELS : GPT_MODELS)[0].id);
             setTurns([]);
             setDraft("");
           }
         }
       } catch (e) {
-        setErr(String(e));
+        if (!isStaleChatNav(g)) {
+          setErr(String(e));
+        }
       }
     },
-    [activeChatId, sending, refreshChats],
+    [activeChatId, provider, sending, refreshChats],
   );
 
   const renameChat = useCallback(
@@ -433,19 +543,23 @@ export function GeminiPanel({ open, onClose, onSendCodeToEditor }: Props) {
         if (c.id === activeChatId) {
           await invoke("save_gemini_conversation", {
             id: c.id,
+            provider,
             model,
             title: t,
             turns: turnPayload(turns),
           });
           setChatTitle(t);
         } else {
-          const f = (await invoke("load_gemini_chat", { id: c.id })) as {
+          const f = (await invoke("load_gemini_chat", { id: c.id, provider })) as {
             id: string;
+            provider?: string;
             model: string;
             turns: { role: string; text: string }[];
           };
+          const prov = f.provider === "gpt" ? "gpt" : "gemini";
           await invoke("save_gemini_conversation", {
             id: f.id,
+            provider: prov,
             model: f.model,
             title: t,
             turns: f.turns,
@@ -456,62 +570,82 @@ export function GeminiPanel({ open, onClose, onSendCodeToEditor }: Props) {
         setErr(String(e));
       }
     },
-    [activeChatId, model, sending, turns, refreshChats],
+    [activeChatId, model, provider, sending, turns, refreshChats],
   );
 
-  // Stream events (Rust `streamGenerateContent` → SSE)
+  const onStreamDone = useCallback(() => {
+    const full = streamAccRef.current;
+    streamAccRef.current = "";
+    setStreamText("");
+    setTurns((prev) => {
+      const next: Turn[] = [...prev, { role: "model", text: full }];
+      const st = stateRef.current;
+      if (st.activeChatId) {
+        let title = st.chatTitle;
+        if (title === "New chat" || !title.trim()) {
+          const d = smartTitle(next);
+          if (d) title = d;
+        }
+        if (title !== st.chatTitle) {
+          setChatTitle(title);
+        }
+        void invoke("save_gemini_conversation", {
+          id: st.activeChatId,
+          provider: st.provider,
+          model: st.model,
+          title,
+          turns: turnPayload(next),
+        })
+          .then(() => refreshChats())
+          .catch(() => {});
+      }
+      setSending(false);
+      return next;
+    });
+  }, [refreshChats]);
+
+  const onStreamError = useCallback((msg: string) => {
+    setErr(msg);
+    streamAccRef.current = "";
+    setStreamText("");
+    setTurns((prev) => prev.slice(0, -1));
+    setDraft(lastUserTextRef.current);
+    setSending(false);
+  }, []);
+
+  // Stream events — Gemini and OpenAI both use SSE from Rust
   useEffect(() => {
     if (!isTauri()) return;
     let cancelled = false;
     let disposers: (() => void)[] = [];
+    const onChunk = (e: { payload: unknown }) => {
+      if (cancelled) return;
+      const piece = e.payload;
+      if (typeof piece === "string" && piece.length) {
+        streamAccRef.current += piece;
+        setStreamText(streamAccRef.current);
+      }
+    };
     const p = Promise.all([
-      listen<string>("gemini-stream-chunk", (e) => {
-        if (cancelled) return;
-        const piece = e.payload;
-        if (typeof piece === "string" && piece.length) {
-          streamAccRef.current += piece;
-          setStreamText(streamAccRef.current);
-        }
-      }),
+      listen<string>("gemini-stream-chunk", onChunk),
       listen("gemini-stream-done", () => {
         if (cancelled) return;
-        const full = streamAccRef.current;
-        streamAccRef.current = "";
-        setStreamText("");
-        setTurns((prev) => {
-          const next: Turn[] = [...prev, { role: "model", text: full }];
-          const st = stateRef.current;
-          if (st.activeChatId) {
-            let title = st.chatTitle;
-            if (title === "New chat" || !title.trim()) {
-              const d = smartTitle(next);
-              if (d) title = d;
-            }
-            if (title !== st.chatTitle) {
-              setChatTitle(title);
-            }
-            void invoke("save_gemini_conversation", {
-              id: st.activeChatId,
-              model: st.model,
-              title,
-              turns: turnPayload(next),
-            })
-              .then(() => refreshChats())
-              .catch(() => {});
-          }
-          setSending(false);
-          return next;
-        });
+        onStreamDone();
       }),
       listen<string>("gemini-stream-error", (e) => {
         if (cancelled) return;
         const msg = typeof e.payload === "string" ? e.payload : "stream error";
-        setErr(msg);
-        streamAccRef.current = "";
-        setStreamText("");
-        setTurns((prev) => prev.slice(0, -1));
-        setDraft(lastUserTextRef.current);
-        setSending(false);
+        onStreamError(msg);
+      }),
+      listen<string>("openai-stream-chunk", onChunk),
+      listen("openai-stream-done", () => {
+        if (cancelled) return;
+        onStreamDone();
+      }),
+      listen<string>("openai-stream-error", (e) => {
+        if (cancelled) return;
+        const msg = typeof e.payload === "string" ? e.payload : "stream error";
+        onStreamError(msg);
       }),
     ]).then((unsubs) => {
       if (cancelled) {
@@ -525,31 +659,39 @@ export function GeminiPanel({ open, onClose, onSendCodeToEditor }: Props) {
       disposers.forEach((u) => u());
       void p;
     };
-  }, [refreshChats]);
+  }, [onStreamDone, onStreamError]);
 
   const saveKey = useCallback(async () => {
     setErr(null);
     if (!isTauri()) return;
     try {
-      await invoke("save_gemini_api_key", { key: keyInput });
+      if (provider === "gemini") {
+        await invoke("save_gemini_api_key", { key: keyInput });
+      } else {
+        await invoke("save_openai_api_key", { key: keyInput });
+      }
       setKeyInput("");
       await refreshKeyState();
     } catch (e) {
       setErr(String(e));
     }
-  }, [keyInput, refreshKeyState]);
+  }, [keyInput, provider, refreshKeyState]);
 
   const clearKey = useCallback(async () => {
     setErr(null);
     if (!isTauri()) return;
     try {
-      await invoke("save_gemini_api_key", { key: "" });
+      if (provider === "gemini") {
+        await invoke("save_gemini_api_key", { key: "" });
+      } else {
+        await invoke("save_openai_api_key", { key: "" });
+      }
       setKeyInput("");
       await refreshKeyState();
     } catch (e) {
       setErr(String(e));
     }
-  }, [refreshKeyState]);
+  }, [provider, refreshKeyState]);
 
   const clearChat = useCallback(async () => {
     setErr(null);
@@ -558,6 +700,7 @@ export function GeminiPanel({ open, onClose, onSendCodeToEditor }: Props) {
       try {
         await invoke("save_gemini_conversation", {
           id: activeChatId,
+          provider,
           model,
           title: chatTitle,
           turns: [],
@@ -567,7 +710,7 @@ export function GeminiPanel({ open, onClose, onSendCodeToEditor }: Props) {
         setErr(String(e));
       }
     }
-  }, [activeChatId, model, chatTitle, refreshChats]);
+  }, [activeChatId, provider, model, chatTitle, refreshChats]);
 
   const flashCopy = useCallback((text: string, key: string) => {
     void navigator.clipboard.writeText(text).then(() => {
@@ -614,14 +757,23 @@ export function GeminiPanel({ open, onClose, onSendCodeToEditor }: Props) {
       }
     }
     try {
+      const m = normalizeModel(provider, model);
+      if (m !== model) {
+        setModel(m);
+      }
       await invoke("save_gemini_conversation", {
         id: activeChatId,
-        model,
+        provider,
+        model: m,
         title,
         turns: turnPayload(nextTurns),
       });
       void refreshChats();
-      await invoke("gemini_start_stream", { model, contents: historyPayload });
+      if (provider === "gemini") {
+        await invoke("gemini_start_stream", { model, contents: historyPayload });
+      } else {
+        await invoke("openai_start_stream", { model, contents: historyPayload });
+      }
     } catch (e) {
       setErr(String(e));
       setTurns((prev) => prev.slice(0, -1));
@@ -630,7 +782,7 @@ export function GeminiPanel({ open, onClose, onSendCodeToEditor }: Props) {
       streamAccRef.current = "";
       setStreamText("");
     }
-  }, [draft, model, sending, turns, sessionReady, activeChatId, chatTitle, refreshChats]);
+  }, [draft, provider, model, sending, turns, sessionReady, activeChatId, chatTitle, refreshChats]);
 
   const onModelChange = useCallback(
     async (next: string) => {
@@ -639,6 +791,7 @@ export function GeminiPanel({ open, onClose, onSendCodeToEditor }: Props) {
       try {
         await invoke("save_gemini_conversation", {
           id: activeChatId,
+          provider,
           model: next,
           title: chatTitle,
           turns: turnPayload(turns),
@@ -648,7 +801,76 @@ export function GeminiPanel({ open, onClose, onSendCodeToEditor }: Props) {
         /* ignore; model still use next for next send */
       }
     },
-    [activeChatId, chatTitle, turns, sending, refreshChats],
+    [activeChatId, provider, chatTitle, turns, sending, refreshChats],
+  );
+
+  const onProviderSet = useCallback(
+    async (p: AiProvider) => {
+      if (p === provider || !isTauri() || !sessionReady || sending) return;
+      const g = nextChatNavGen();
+      setErr(null);
+      const firstModel = (p === "gemini" ? GEMINI_MODELS : GPT_MODELS)[0].id;
+      try {
+        await saveCurrentConv();
+        if (isStaleChatNav(g)) {
+          return;
+        }
+        let list = (await invoke("list_gemini_chats", { provider: p })) as ChatListItem[];
+        if (isStaleChatNav(g)) {
+          return;
+        }
+        if (list.length === 0) {
+          await invoke("new_gemini_chat", { provider: p });
+          list = (await invoke("list_gemini_chats", { provider: p })) as ChatListItem[];
+        }
+        if (isStaleChatNav(g)) {
+          return;
+        }
+        const first = list[0];
+        if (first) {
+          const f = (await invoke("load_gemini_chat", { id: first.id, provider: p })) as {
+            id: string;
+            title: string;
+            model: string;
+            turns: { role: string; text: string }[];
+          };
+          if (isStaleChatNav(g)) {
+            return;
+          }
+          setProvider(p);
+          setChats(list);
+          setActiveChatId(f.id);
+          setChatTitle(f.title);
+          setModel(normalizeModel(p, f.model));
+          setTurns(
+            f.turns.map((t) => ({
+              role: t.role === "model" ? "model" : "user",
+              text: t.text,
+            })),
+          );
+        } else {
+          if (isStaleChatNav(g)) {
+            return;
+          }
+          setProvider(p);
+          setChats(list);
+          setActiveChatId(null);
+          setChatTitle("New chat");
+          setModel(firstModel);
+          setTurns([]);
+        }
+        setDraft("");
+        if (isStaleChatNav(g)) {
+          return;
+        }
+        await refreshChats(p);
+      } catch (e) {
+        if (!isStaleChatNav(g)) {
+          setErr(String(e));
+        }
+      }
+    },
+    [provider, sessionReady, sending, saveCurrentConv, refreshChats],
   );
 
   const [frame, setFrame] = useState<Rect>(() => defaultWindowRect());
@@ -730,7 +952,7 @@ export function GeminiPanel({ open, onClose, onSendCodeToEditor }: Props) {
     <div
       className="gemini-pnl-outer"
       role="dialog"
-      aria-label="Gemini (API)"
+      aria-label="AI (API)"
       style={{
         position: "fixed",
         left: frame.x,
@@ -749,7 +971,7 @@ export function GeminiPanel({ open, onClose, onSendCodeToEditor }: Props) {
           onMouseDown={onTitleBarMouseDown}
           title="Drag to move"
         >
-          <span className="gemini-pnl-titletext">Gemini</span>
+          <span className="gemini-pnl-titletext">AI</span>
           <button
             type="button"
             className="win9x-close-btn"
@@ -781,45 +1003,45 @@ export function GeminiPanel({ open, onClose, onSendCodeToEditor }: Props) {
                 </p>
               ) : (
                 <ul className="gemini-hist-list">
-                  {chats.map((c) => (
-                    <li
-                      key={c.id}
-                      className={`gemini-hist-item ${c.id === activeChatId ? "is-active" : ""}`}
-                    >
-                      <button
-                        type="button"
-                        className="gemini-hist-row"
+                  {chats.map((c) => {
+                    const isSelected = c.id === activeChatId;
+                    return (
+                      <li
+                        key={c.id}
+                        className={`gemini-hist-item ${isSelected ? "is-active" : ""}`}
                         onClick={() => void openChat(c.id)}
-                        disabled={sending}
                         title={c.title}
+                        aria-current={isSelected ? "true" : undefined}
                       >
-                        <span className="gemini-hist-title">{c.title || "—"}</span>
-                        <span className="gemini-hist-time">{formatChatTime(c.updated_at)}</span>
-                      </button>
-                      <div className="gemini-hist-tools">
-                        <button
-                          type="button"
-                          className="win-link-btn"
-                          onClick={() => void renameChat(c)}
-                          disabled={sending}
-                          title="Rename"
-                          aria-label="Rename"
-                        >
-                          ✎
-                        </button>
-                        <button
-                          type="button"
-                          className="win-link-btn"
-                          onClick={() => void removeChat(c.id)}
-                          disabled={sending}
-                          title="Delete"
-                          aria-label="Delete"
-                        >
-                          ×
-                        </button>
-                      </div>
-                    </li>
-                  ))}
+                        <div className="gemini-hist-main">
+                          <span className="gemini-hist-title">{c.title || "—"}</span>
+                          <span className="gemini-hist-time">{formatChatTime(c.updated_at)}</span>
+                        </div>
+                        <div className="gemini-hist-tools" onClick={(e) => e.stopPropagation()}>
+                          <button
+                            type="button"
+                            className="win-link-btn"
+                            onClick={() => void renameChat(c)}
+                            disabled={sending}
+                            title="Rename"
+                            aria-label="Rename"
+                          >
+                            ✎
+                          </button>
+                          <button
+                            type="button"
+                            className="win-link-btn"
+                            onClick={() => void removeChat(c.id)}
+                            disabled={sending}
+                            title="Delete"
+                            aria-label="Delete"
+                          >
+                            ×
+                          </button>
+                        </div>
+                      </li>
+                    );
+                  })}
                 </ul>
               )}
             </aside>
@@ -829,30 +1051,65 @@ export function GeminiPanel({ open, onClose, onSendCodeToEditor }: Props) {
             <div className="win-pop-body gemini-pnl-body">
               {!isTauri() && (
                 <p className="win-pop-txt" style={{ marginTop: 0 }}>
-                  The Gemini chat uses the app backend and only runs in the desktop (Tauri) build. Open with{" "}
-                  <code className="win-pop-code">npm run tauri dev</code>. Saved chats and memory are
-                  available there only.
+                  The AI panel uses the app backend and only runs in the desktop (Tauri) build. Open with{" "}
+                  <code className="win-pop-code">npm run tauri dev</code>. Saved chats and keys are available
+                  there only.
                 </p>
               )}
 
               {isTauri() && (
                 <>
-                  <p className="win-pop-txt" style={{ marginTop: 0 }}>
-                    The key is stored in your app data directory and is only used from Rust to call Google; it
-                    is not sent to the editor JavaScript. Chats are saved as files next to the key.{" "}
+                <p className="win-pop-txt" style={{ marginTop: 0 }}>
+                  Keys stay in your app data folder; requests go from Rust, not the webview. Chats are saved
+                  as local files.{" "}
+                    {provider === "gemini" ? (
+                      <button
+                        type="button"
+                        className="win-link-btn"
+                        onClick={() => void openUrl("https://aistudio.google.com/apikey")}
+                      >
+                        Google AI key
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        className="win-link-btn"
+                        onClick={() => void openUrl("https://platform.openai.com/api-keys")}
+                      >
+                        OpenAI key
+                      </button>
+                    )}
+                  </p>
+                  <div className="ai-pnl-provt" role="group" aria-label="Model provider">
+                    <span className="ai-pnl-provt-lab">Use</span>
                     <button
                       type="button"
-                      className="win-link-btn"
-                      onClick={() => void openUrl("https://aistudio.google.com/apikey")}
+                      className={`ai-pnv-btn ${provider === "gemini" ? "is-on" : ""}`}
+                      onClick={() => void onProviderSet("gemini")}
+                      disabled={!sessionReady || sending}
                     >
-                      Get a key
+                      Gemini
                     </button>
-                  </p>
+                    <button
+                      type="button"
+                      className={`ai-pnv-btn ${provider === "gpt" ? "is-on" : ""}`}
+                      onClick={() => void onProviderSet("gpt")}
+                      disabled={!sessionReady || sending}
+                    >
+                      GPT
+                    </button>
+                  </div>
                   <div className="gemini-pnl-keyrow">
                     <input
                       type="password"
                       className="win-pop-inp"
-                      placeholder={hasKey ? "•••• key on file — paste to replace" : "Paste Generative Language API key"}
+                      placeholder={
+                        hasKey
+                          ? "•••• key on file — paste to replace"
+                          : provider === "gemini"
+                            ? "Google Generative Language API key"
+                            : "OpenAI API key (sk-…)"
+                      }
                       value={keyInput}
                       onChange={(e) => setKeyInput(e.target.value)}
                       autoComplete="off"
@@ -873,17 +1130,17 @@ export function GeminiPanel({ open, onClose, onSendCodeToEditor }: Props) {
                       )}
                     </div>
                   </div>
-                  <label className="win-pop-lab" htmlFor="gemini-model" style={{ marginTop: 6 }}>
+                  <label className="win-pop-lab" htmlFor="ai-model" style={{ marginTop: 6 }}>
                     Model
                   </label>
                   <select
-                    id="gemini-model"
+                    id="ai-model"
                     className="win-pop-inp gemini-pnl-select"
                     value={model}
                     onChange={(e) => void onModelChange(e.target.value)}
                     disabled={!hasKey || !sessionReady}
                   >
-                    {MODELS.map((m) => (
+                    {modelsForProvider.map((m) => (
                       <option key={m.id} value={m.id}>
                         {m.label}
                       </option>
@@ -929,13 +1186,14 @@ export function GeminiPanel({ open, onClose, onSendCodeToEditor }: Props) {
                         onCopy={flashCopy}
                         onSendToEditor={onSendCodeToEditor ? sendCodeToEditor : undefined}
                         editorToEditorFlash={editorToEditorFlash}
+                        assistantLabel={assistantLabel}
                       />
                     )}
                   </div>
                 ))}
                 {sending && (
                   <div className="gemini-msg gemini-msg-model">
-                    <span className="gemini-msg-who">Gemini</span>
+                    <span className="gemini-msg-who">{assistantLabel}</span>
                     <div className="gemini-msg-txt">
                       {streamText}
                       <span className="gemini-stream-cursor" aria-hidden>

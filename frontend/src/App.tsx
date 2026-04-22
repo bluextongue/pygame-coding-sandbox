@@ -5,6 +5,7 @@ import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import Editor, { type OnChange } from "@monaco-editor/react";
 import { GeminiPanel } from "./GeminiPanel";
+import { PixelLabPanel } from "./PixelLabPanel";
 
 const AUTOSAVE_MS = 600;
 const CONSOLE_MAX = 2000;
@@ -59,6 +60,22 @@ function extLabel(name: string): string {
   return m ? m[1] : "…";
 }
 
+/**
+ * `convertFileSrc` URLs are cached aggressively; reusing a filename after a rename/replace
+ * can show the old bitmap until the href changes. Bust the cache with list epoch + name.
+ */
+function withAssetImageCacheBust(fileSrc: string, listEpoch: number, name: string): string {
+  try {
+    const u = new URL(fileSrc);
+    u.searchParams.set("t", String(listEpoch));
+    u.searchParams.set("n", name);
+    return u.toString();
+  } catch {
+    const sep = fileSrc.includes("?") ? "&" : "?";
+    return `${fileSrc}${sep}t=${listEpoch}&n=${encodeURIComponent(name)}`;
+  }
+}
+
 /** For rename inputs: place caret just before the last “.” (extension) so the stem is easy to edit. */
 function caretIndexBeforeLastDot(filename: string): number {
   const last = filename.lastIndexOf(".");
@@ -68,6 +85,8 @@ function caretIndexBeforeLastDot(filename: string): number {
 
 type AssetListItemProps = {
   name: string;
+  /** Bumped when the asset list refreshes so thumbnails reload (WebView caches `convertFileSrc` URLs). */
+  thumbEpoch: number;
   isEditing: boolean;
   renameBuffer: string;
   onRenameBufferChange: (v: string) => void;
@@ -80,6 +99,7 @@ type AssetListItemProps = {
 
 function AssetListItem({
   name,
+  thumbEpoch,
   isEditing,
   renameBuffer,
   onRenameBufferChange,
@@ -122,6 +142,8 @@ function AssetListItem({
     };
   }, [name, needPath]);
 
+  const thumbKey = `${name}-${thumbEpoch}`;
+
   useLayoutEffect(() => {
     if (!isEditing) return;
     const el = assetRenameInputRef.current;
@@ -136,13 +158,18 @@ function AssetListItem({
     return () => cancelAnimationFrame(id);
   }, [isEditing, name]);
 
+  const imgSrc = mediaUrl
+    ? withAssetImageCacheBust(mediaUrl, thumbEpoch, name)
+    : null;
+
   return (
     <li className="asset-row">
       <div className="asset-thumb-wrap">
-        {isImageFile(name) && mediaUrl && !thumbFailed ? (
+        {isImageFile(name) && imgSrc && !thumbFailed ? (
           <img
+            key={thumbKey}
             className="asset-thumb"
-            src={mediaUrl}
+            src={imgSrc}
             alt=""
             onError={() => setThumbFailed(true)}
           />
@@ -208,6 +235,7 @@ export default function App() {
   const [code, setCode] = useState(defaultCode);
   const [ready, setReady] = useState(false);
   const [assets, setAssets] = useState<string[]>([]);
+  const [assetsThumbEpoch, setAssetsThumbEpoch] = useState(0);
   const [consoleText, setConsoleText] = useState("");
   const [running, setRunning] = useState(false);
   const [editing, setEditing] = useState<string | null>(null);
@@ -221,6 +249,7 @@ export default function App() {
   const [deleteTarget, setDeleteTarget] = useState<GameInfo | null>(null);
   const [exportDone, setExportDone] = useState<ExportResult | null>(null);
   const [geminiOpen, setGeminiOpen] = useState(false);
+  const [pixelLabOpen, setPixelLabOpen] = useState(false);
   const projectMenuRef = useRef<HTMLDivElement>(null);
 
   const codeRef = useRef(code);
@@ -242,6 +271,7 @@ export default function App() {
     if (!isTauri()) return;
     const list = (await invoke("list_assets")) as string[];
     setAssets(list);
+    setAssetsThumbEpoch((n) => n + 1);
   }, []);
 
   const appendConsole = useCallback((line: string) => {
@@ -268,6 +298,7 @@ export default function App() {
       setGames(gList);
       setCode(main);
       setAssets(alist);
+      setAssetsThumbEpoch((n) => n + 1);
     } catch (e) {
       appendConsole(String(e));
     }
@@ -572,7 +603,8 @@ export default function App() {
   }, [projectMenuOpen]);
 
   useEffect(() => {
-    if (!floatKind && !deleteTarget && !projectMenuOpen && !exportDone && !geminiOpen) return;
+    if (!floatKind && !deleteTarget && !projectMenuOpen && !exportDone && !geminiOpen && !pixelLabOpen)
+      return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
         setFloatKind(null);
@@ -580,11 +612,12 @@ export default function App() {
         setProjectMenuOpen(false);
         setExportDone(null);
         setGeminiOpen(false);
+        setPixelLabOpen(false);
       }
     };
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
-  }, [floatKind, deleteTarget, projectMenuOpen, exportDone, geminiOpen]);
+  }, [floatKind, deleteTarget, projectMenuOpen, exportDone, geminiOpen, pixelLabOpen]);
 
   return (
     <div className="app">
@@ -670,17 +703,26 @@ export default function App() {
           </div>
         )}
 
+        {isTauri() && (
+          <button
+            type="button"
+            className="gemini-btn"
+            onClick={() => setPixelLabOpen(true)}
+            title="Pixel Lab — generate pixel art (token from pixellab.ai)"
+            aria-label="Open Pixel Lab"
+          >
+            Pixel Lab
+          </button>
+        )}
+
         <button
           type="button"
           className="gemini-btn"
           onClick={() => setGeminiOpen(true)}
-          title="Open Gemini: save your Generative Language API key and chat (calls go from the app, not the browser)"
-          aria-label="Open Gemini (API key)"
+          title="Open AI: Google Gemini or OpenAI GPT — keys and chat in the app backend"
+          aria-label="Open AI panel"
         >
-          <span className="gemini-btn-ico" aria-hidden>
-            ◆
-          </span>
-          Gemini
+          AI
         </button>
 
         <div className="top-bar-actions" role="group" aria-label="Run controls">
@@ -722,7 +764,15 @@ export default function App() {
         />
       )}
 
-      {geminiOpen && <div className="set-float-back" onMouseDown={() => setGeminiOpen(false)} />}
+      {(geminiOpen || pixelLabOpen) && (
+        <div
+          className="set-float-back"
+          onMouseDown={() => {
+            setGeminiOpen(false);
+            setPixelLabOpen(false);
+          }}
+        />
+      )}
       {/* Always mount Gemini so stream listeners + live text keep running when the user closes the overlay */}
       <div
         className="set-float"
@@ -733,6 +783,19 @@ export default function App() {
           open={geminiOpen}
           onClose={() => setGeminiOpen(false)}
           onSendCodeToEditor={applyGeminiCodeToEditor}
+        />
+      </div>
+
+      <div
+        className="set-float"
+        style={{ zIndex: 121, display: pixelLabOpen && isTauri() ? "flex" : "none" }}
+        aria-hidden={!pixelLabOpen}
+      >
+        <PixelLabPanel
+          open={pixelLabOpen}
+          onClose={() => setPixelLabOpen(false)}
+          onAssetsChanged={refreshAssets}
+          projectAssets={assets}
         />
       </div>
 
@@ -850,6 +913,7 @@ export default function App() {
                 <AssetListItem
                   key={`${activeGame?.id ?? "local"}-${name}`}
                   name={name}
+                  thumbEpoch={assetsThumbEpoch}
                   isEditing={editing === name}
                   renameBuffer={renameBuffer}
                   onRenameBufferChange={setRenameBuffer}

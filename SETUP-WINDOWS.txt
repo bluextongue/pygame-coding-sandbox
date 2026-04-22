@@ -1,0 +1,53 @@
+================================================================================
+  Pygame Coding Sandbox — Windows (Cursor) setup
+================================================================================
+
+WHAT PASTING THE GITHUB LINK DOES
+  In Cursor, "Git: Clone" with:
+    https://github.com/bluextongue/pygame-coding-sandbox
+  only downloads the project and opens the folder. It does NOT install
+  Node.js, Rust, the Microsoft C++ compiler, or Python. You need those
+  once on the PC (see below).
+
+WHAT TO INSTALL FIRST (one time per Windows PC)
+  1) Git for Windows          — https://git-scm.com/download/win
+  2) Node.js LTS (includes npm) — https://nodejs.org/
+  3) Rust (rustup)            — https://rustup.rs/  (choose default stable)
+  4) Visual Studio Build Tools, with workload:
+     "Desktop development with C++"
+     — https://visualstudio.microsoft.com/visual-cpp-build-tools/
+     (Tauri needs MSVC to compile the Rust + native app on Windows.)
+  5) Python 3 (for running games in the app)
+     — https://www.python.org/downloads/
+     During install, check "Add python.exe to PATH".
+
+AFTER THE REPO IS OPEN IN CURSOR
+  Open a terminal in Cursor (Terminal → New Terminal) at the project folder,
+  then run in order:
+
+    npm install
+    npm run tauri dev
+
+  First run can take a while (downloads Rust deps + compiles).
+
+TO BUILD A WINDOWS INSTALLER (for download links, etc.)
+    npm run tauri build
+
+  Output is under:
+    src-tauri\target\release\bundle\
+
+  Use the .exe / .msi / nsis from there as your Windows download (after
+  you test the build).
+
+PYGAME
+  The app runs your `main.py` with the `python` on PATH. Install pygame
+  once in that Python:
+
+    python -m pip install pygame
+
+USING THIS FILE IN CURSOR
+  In the AI chat, type @ and attach "SETUP-WINDOWS.txt" (or @SETUP-WINDOWS)
+  and ask: "Follow this and tell me what to do next" — it will not replace
+  installing Build Tools, but it can help with exact commands and errors.
+
+================================================================================

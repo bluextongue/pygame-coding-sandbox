@@ -169,6 +169,21 @@ fn active_sandbox_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
   Ok(d)
 }
 
+/// Project folder for a known game id (used so long PixelLab jobs save to the project that was active when generation started).
+fn game_sandbox_dir_by_id(app: &tauri::AppHandle, project_id: &str) -> Result<PathBuf, String> {
+  let base = app_workspace_dir(app)?;
+  let state = load_or_init_games_state(&base)?;
+  if !state.games.iter().any(|g| g.id == project_id) {
+    return Err("unknown project".to_string());
+  }
+  let d = base.join(GAMES_DIR).join(project_id);
+  if !d.is_dir() {
+    return Err("project folder missing on disk".to_string());
+  }
+  ensure_game_dir_flat(&d)?;
+  Ok(d)
+}
+
 fn is_reserved_data_filename(name: &str) -> bool {
   name.eq_ignore_ascii_case("main.py")
 }
@@ -876,7 +891,272 @@ fn read_gemini_api_key(app: &tauri::AppHandle) -> Result<String, String> {
   Ok(t.to_string())
 }
 
-#[derive(serde::Deserialize, serde::Serialize, Clone, Debug)]
+// ---- OpenAI (Chat Completions) — key on disk, requests from Rust ----
+
+fn openai_key_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+  let base = app.path().app_data_dir().map_err(|e| e.to_string())?;
+  Ok(base.join("openai_api_key"))
+}
+
+#[tauri::command]
+fn save_openai_api_key(app: tauri::AppHandle, key: String) -> Result<(), String> {
+  let key = key.trim();
+  let p = openai_key_path(&app)?;
+  if key.is_empty() {
+    if p.is_file() {
+      fs::remove_file(&p).map_err(|e| e.to_string())?;
+    }
+    return Ok(());
+  }
+  if let Some(parent) = p.parent() {
+    fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+  }
+  fs::write(&p, key.as_bytes()).map_err(|e| e.to_string())?;
+  #[cfg(unix)]
+  {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(m) = fs::metadata(&p) {
+      let mut perm = m.permissions();
+      perm.set_mode(0o600);
+      let _ = fs::set_permissions(&p, perm);
+    }
+  }
+  Ok(())
+}
+
+#[tauri::command]
+fn openai_key_configured(app: tauri::AppHandle) -> Result<bool, String> {
+  let p = openai_key_path(&app)?;
+  if !p.is_file() {
+    return Ok(false);
+  }
+  let s = fs::read_to_string(&p).map_err(|e| e.to_string())?;
+  Ok(!s.trim().is_empty())
+}
+
+fn read_openai_api_key(app: &tauri::AppHandle) -> Result<String, String> {
+  let p = openai_key_path(app)?;
+  if !p.is_file() {
+    return Err("add an OpenAI API key first".to_string());
+  }
+  let s = fs::read_to_string(&p).map_err(|e| e.to_string())?;
+  let t = s.trim();
+  if t.is_empty() {
+    return Err("add an OpenAI API key first".to_string());
+  }
+  Ok(t.to_string())
+}
+
+// ---- PixelLab (https://api.pixellab.ai/v2) — key on disk, requests from Rust (see v2/llms.txt) ----
+
+const PIXELLAB_V2: &str = "https://api.pixellab.ai/v2";
+
+fn pixellab_key_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+  let base = app.path().app_data_dir().map_err(|e| e.to_string())?;
+  Ok(base.join("pixellab_api_key"))
+}
+
+#[tauri::command]
+fn save_pixellab_api_key(app: tauri::AppHandle, key: String) -> Result<(), String> {
+  let key = key.trim();
+  let p = pixellab_key_path(&app)?;
+  if key.is_empty() {
+    if p.is_file() {
+      fs::remove_file(&p).map_err(|e| e.to_string())?;
+    }
+    return Ok(());
+  }
+  if let Some(parent) = p.parent() {
+    fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+  }
+  fs::write(&p, key.as_bytes()).map_err(|e| e.to_string())?;
+  #[cfg(unix)]
+  {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(m) = fs::metadata(&p) {
+      let mut perm = m.permissions();
+      perm.set_mode(0o600);
+      let _ = fs::set_permissions(&p, perm);
+    }
+  }
+  Ok(())
+}
+
+#[tauri::command]
+fn pixellab_key_configured(app: tauri::AppHandle) -> Result<bool, String> {
+  let p = pixellab_key_path(&app)?;
+  if !p.is_file() {
+    return Ok(false);
+  }
+  let s = fs::read_to_string(&p).map_err(|e| e.to_string())?;
+  Ok(!s.trim().is_empty())
+}
+
+fn read_pixellab_api_key(app: &tauri::AppHandle) -> Result<String, String> {
+  let p = pixellab_key_path(app)?;
+  if !p.is_file() {
+    return Err("add a PixelLab API token first (pixellab.ai account)".to_string());
+  }
+  let s = fs::read_to_string(&p).map_err(|e| e.to_string())?;
+  let t = s.trim();
+  if t.is_empty() {
+    return Err("add a PixelLab API token first".to_string());
+  }
+  Ok(t.to_string())
+}
+
+fn pixellab_http_client() -> Result<reqwest::blocking::Client, String> {
+  reqwest::blocking::Client::builder()
+    .timeout(std::time::Duration::from_secs(300))
+    .build()
+    .map_err(|e| e.to_string())
+}
+
+fn pixellab_get_path_ok(path: &str) -> bool {
+  let path_only = path.split('?').next().unwrap_or(path);
+  if path_only == "/balance" {
+    return true;
+  }
+  if path_only == "/characters" {
+    return true;
+  }
+  if let Some(r) = path_only.strip_prefix("/background-jobs/") {
+    let id = r.trim_end_matches('/');
+    return is_valid_chat_id(id);
+  }
+  if let Some(r) = path_only.strip_prefix("/isometric-tiles/") {
+    let id = r.split('/').next().unwrap_or(r);
+    return is_valid_chat_id(id);
+  }
+  if let Some(r) = path_only.strip_prefix("/tilesets/") {
+    let segs: Vec<&str> = r.split('/').filter(|s| !s.is_empty()).collect();
+    if segs.len() == 1 {
+      return is_valid_chat_id(segs[0]);
+    }
+  }
+  if let Some(r) = path_only.strip_prefix("/characters/") {
+    let segs: Vec<&str> = r.split('/').filter(|s| !s.is_empty()).collect();
+    if segs.is_empty() {
+      return false;
+    }
+    if !is_valid_chat_id(segs[0]) {
+      return false;
+    }
+    if segs.len() == 1 {
+      return true;
+    }
+    if segs.len() == 2 && (segs[1] == "zip" || segs[1] == "animations") {
+      return true;
+    }
+  }
+  false
+}
+
+const PIXELLAB_POST_PATHS: &[&str] = &[
+  "/create-image-pixflux",
+  "/generate-image-v2",
+  "/create-character-with-4-directions",
+  "/create-character-with-8-directions",
+  "/create-isometric-tile",
+  "/map-objects",
+  // Follow-ups for existing characters (see https://api.pixellab.ai/v2/llms.txt)
+  "/animate-character",
+  "/characters/animations",
+  "/generate-with-style-v2",
+  "/generate-8-rotations-v2",
+  // Still + motion: image → animation (v3 returns a background job; poll for frames)
+  "/animate-with-text-v3",
+  "/create-tileset",
+];
+
+fn pixellab_post_path_ok(path: &str) -> bool {
+  path.split('?').next().is_some_and(|p| PIXELLAB_POST_PATHS.contains(&p))
+}
+
+/// GET `https://api.pixellab.ai/v2` + path (path may include `?…` for `/characters?limit=…`).
+#[tauri::command]
+fn pixellab_v2_get(app: tauri::AppHandle, path: String) -> Result<String, String> {
+  if !path.starts_with('/') || path.contains("..") {
+    return Err("invalid path".to_string());
+  }
+  if !pixellab_get_path_ok(&path) {
+    return Err("request not allowed".to_string());
+  }
+  let key = read_pixellab_api_key(&app)?;
+  let url = format!("{PIXELLAB_V2}{path}");
+  let client = pixellab_http_client()?;
+  let res = client
+    .get(&url)
+    .header("Authorization", format!("Bearer {key}"))
+    .header("Accept", "application/json")
+    .send()
+    .map_err(|e| e.to_string())?;
+  let status = res.status();
+  let text = res.text().map_err(|e| e.to_string())?;
+  if !status.is_success() {
+    return Err(format!("PixelLab HTTP {status}: {text}"));
+  }
+  Ok(text)
+}
+
+/// POST JSON to an allowlisted PixelLab v2 path; returns response body (JSON text).
+#[tauri::command]
+fn pixellab_v2_post(app: tauri::AppHandle, path: String, body: serde_json::Value) -> Result<String, String> {
+  if !path.starts_with('/') || path.contains("..") {
+    return Err("invalid path".to_string());
+  }
+  if !pixellab_post_path_ok(&path) {
+    return Err("request not allowed".to_string());
+  }
+  let key = read_pixellab_api_key(&app)?;
+  let url = format!("{PIXELLAB_V2}{path}");
+  let client = pixellab_http_client()?;
+  let res = client
+    .post(&url)
+    .header("Authorization", format!("Bearer {key}"))
+    .header("Content-Type", "application/json")
+    .json(&body)
+    .send()
+    .map_err(|e| e.to_string())?;
+  let status = res.status();
+  let text = res.text().map_err(|e| e.to_string())?;
+  if !status.is_success() {
+    return Err(format!("PixelLab HTTP {status}: {text}"));
+  }
+  Ok(text)
+}
+
+/// Write a PNG (or any bytes) into a game folder next to `main.py` with collision-safe name.
+/// `project_id` is the [`GameInfo::id`] for the target project; use `None` for the currently active project.
+#[tauri::command]
+fn write_project_asset_bytes(
+  app: tauri::AppHandle,
+  filename: String,
+  data: Vec<u8>,
+  project_id: Option<String>,
+) -> Result<String, String> {
+  if data.is_empty() {
+    return Err("empty data".to_string());
+  }
+  let name = filename.trim();
+  if name.is_empty() || name.contains("..") || name.contains('/') || name.contains('\\') {
+    return Err("invalid file name".to_string());
+  }
+  if is_reserved_data_filename(name) {
+    return Err("that name is reserved for project code (main.py)".to_string());
+  }
+  let root = match project_id.as_deref() {
+    None | Some("") => active_sandbox_dir(&app)?,
+    Some(id) => game_sandbox_dir_by_id(&app, id)?,
+  };
+  let final_name = unique_name(&root, name);
+  let p = root.join(&final_name);
+  fs::write(&p, data).map_err(|e| e.to_string())?;
+  let _ = app.emit("assets-updated", serde_json::Value::Null);
+  Ok(final_name)
+}
+
+#[derive(serde::Deserialize, serde::Serialize, Clone, Debug, PartialEq, Eq)]
 pub struct GeminiTurn {
   pub role: String,
   pub text: String,
@@ -889,6 +1169,48 @@ const GEMINI_MODEL_ALLOWLIST: &[&str] = &[
   "gemini-1.5-flash",
   "gemini-1.5-pro",
 ];
+
+const OPENAI_MODEL_ALLOWLIST: &[&str] = &[
+  "gpt-5.4",
+  "gpt-5.4-2026-03-05",
+  "gpt-5.4-pro",
+  "gpt-5.4-pro-2026-03-05",
+  "gpt-5.4-mini",
+  "gpt-5.4-mini-2026-03-17",
+  "gpt-5.4-nano",
+  "gpt-5.4-nano-2026-03-17",
+  "gpt-5.2",
+  "gpt-5.2-2025-12-11",
+  "gpt-5.1",
+  "gpt-5.1-2025-11-13",
+  "gpt-5",
+  "gpt-5-2025-08-07",
+  "gpt-5-mini",
+  "gpt-5-mini-2025-08-07",
+  "gpt-5-nano",
+  "gpt-5-nano-2025-08-07",
+  "gpt-4o",
+  "gpt-4o-mini",
+  "gpt-4-turbo",
+  "gpt-3.5-turbo",
+];
+
+fn validate_model_for_provider(provider: &str, model: &str) -> Result<(), String> {
+  match provider {
+    "gemini" => {
+      if !GEMINI_MODEL_ALLOWLIST.contains(&model) {
+        return Err("unsupported model".to_string());
+      }
+    }
+    "gpt" => {
+      if !OPENAI_MODEL_ALLOWLIST.contains(&model) {
+        return Err("unsupported model".to_string());
+      }
+    }
+    _ => return Err("invalid provider".to_string()),
+  }
+  Ok(())
+}
 
 /// Concatenate `parts[].text` in one streamed JSON chunk (metadata-only → empty string).
 /// Do not short-circuit on `SAFETY` before reading `parts` — a chunk can include text + finish reason.
@@ -1081,11 +1403,166 @@ fn gemini_start_stream(app: tauri::AppHandle, model: String, contents: Vec<Gemin
   Ok(())
 }
 
-// ---- Saved Gemini chat sessions (one JSON per chat, app data) ----
+fn openai_chunk_text(v: &serde_json::Value) -> String {
+  let mut out = String::new();
+  let Some(choices) = v.get("choices").and_then(|c| c.as_array()) else {
+    return out;
+  };
+  for ch in choices {
+    if let Some(c) = ch
+      .get("delta")
+      .and_then(|d| d.get("content"))
+      .and_then(|c| c.as_str())
+    {
+      out.push_str(c);
+    }
+  }
+  out
+}
 
-fn gemini_chats_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+fn build_openai_messages(contents: &[GeminiTurn]) -> Vec<serde_json::Value> {
+  contents
+    .iter()
+    .map(|t| {
+      let role = if t.role == "model" {
+        "assistant"
+      } else {
+        "user"
+      };
+      serde_json::json!({
+        "role": role,
+        "content": t.text
+      })
+    })
+    .collect()
+}
+
+/// Chat Completions streaming; emits `openai-stream-chunk`, `openai-stream-done`, `openai-stream-error`.
+#[tauri::command]
+fn openai_start_stream(app: tauri::AppHandle, model: String, contents: Vec<GeminiTurn>) -> Result<(), String> {
+  validate_model_for_provider("gpt", &model)?;
+  validate_gemini_chat(&contents)?;
+  let key = read_openai_api_key(&app)?;
+  let messages = build_openai_messages(&contents);
+  let m = model.to_ascii_lowercase();
+  // GPT-5+ rejects `max_tokens`; it expects `max_completion_tokens` (Chat Completions).
+  let use_max_completion_tokens = m.starts_with("gpt-5");
+  let body = if use_max_completion_tokens {
+    serde_json::json!({
+      "model": model,
+      "messages": messages,
+      "stream": true,
+      "max_completion_tokens": 8192u32,
+      "temperature": 0.9
+    })
+  } else {
+    serde_json::json!({
+      "model": model,
+      "messages": messages,
+      "stream": true,
+      "max_tokens": 8192u32,
+      "temperature": 0.9
+    })
+  };
+  let app_thread = app.clone();
+  std::thread::spawn(move || {
+    let client = match reqwest::blocking::Client::builder()
+      .timeout(std::time::Duration::from_secs(300))
+      .build()
+    {
+      Ok(c) => c,
+      Err(e) => {
+        let _ = app_thread.emit("openai-stream-error", e.to_string());
+        return;
+      }
+    };
+    let res = match client
+      .post("https://api.openai.com/v1/chat/completions")
+      .header("Authorization", format!("Bearer {key}"))
+      .header("Content-Type", "application/json")
+      .json(&body)
+      .send()
+    {
+      Ok(r) => r,
+      Err(e) => {
+        let _ = app_thread.emit("openai-stream-error", format!("network: {e}"));
+        return;
+      }
+    };
+    let status = res.status();
+    if !status.is_success() {
+      let text = res.text().unwrap_or_default();
+      if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+        if let Some(msg) = v.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str()) {
+          let _ = app_thread.emit("openai-stream-error", msg.to_string());
+          return;
+        }
+      }
+      let _ = app_thread.emit("openai-stream-error", format!("API error (HTTP {status}): {text}"));
+      return;
+    }
+    let mut reader = BufReader::new(res);
+    let mut line = String::new();
+    let mut any_chunk = false;
+    loop {
+      line.clear();
+      match reader.read_line(&mut line) {
+        Ok(0) => break,
+        Ok(_) => {}
+        Err(e) => {
+          let _ = app_thread.emit("openai-stream-error", e.to_string());
+          return;
+        }
+      }
+      let trimmed = line.trim();
+      if trimmed.is_empty() {
+        continue;
+      }
+      let json_str = if trimmed
+        .get(..5)
+        .is_some_and(|h| h.eq_ignore_ascii_case("data:"))
+      {
+        trimmed[5..].trim()
+      } else {
+        trimmed
+      };
+      let json_str = json_str.trim_start_matches('\u{feff}');
+      if json_str == "[DONE]" {
+        break;
+      }
+      let v: serde_json::Value = match serde_json::from_str(json_str) {
+        Ok(v) => v,
+        Err(_) => continue,
+      };
+      if let Some(msg) = v.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str()) {
+        let _ = app_thread.emit("openai-stream-error", msg.to_string());
+        return;
+      }
+      let piece = openai_chunk_text(&v);
+      if !piece.is_empty() {
+        any_chunk = true;
+        let _ = app_thread.emit("openai-stream-chunk", piece);
+      }
+    }
+    if !any_chunk {
+      let _ = app_thread.emit("openai-stream-error", "empty reply from model");
+      return;
+    }
+    let _ = app_thread.emit("openai-stream-done", "");
+  });
+  Ok(())
+}
+
+// ---- AI chat sessions: separate folders per provider (gemini | gpt) ----
+
+fn ai_chats_dir_for_provider(app: &tauri::AppHandle, provider: &str) -> Result<PathBuf, String> {
   let base = app.path().app_data_dir().map_err(|e| e.to_string())?;
-  let d = base.join("gemini_chats");
+  let sub = match provider {
+    "gemini" => "gemini_chats",
+    "gpt" => "gpt_chats",
+    _ => return Err("invalid provider".to_string()),
+  };
+  let d = base.join(sub);
   if !d.is_dir() {
     fs::create_dir_all(&d).map_err(|e| e.to_string())?;
   }
@@ -1110,10 +1587,17 @@ fn chat_path(dir: &Path, id: &str) -> Result<PathBuf, String> {
   Ok(dir.join(format!("{id}.json")))
 }
 
+fn default_ai_provider() -> String {
+  "gemini".to_string()
+}
+
 #[derive(serde::Deserialize, serde::Serialize, Clone, Debug)]
 pub struct GeminiChatFile {
   pub id: String,
   pub title: String,
+  /// `"gemini"` | `"gpt"` — older files omit this and deserialize as Gemini.
+  #[serde(default = "default_ai_provider")]
+  pub provider: String,
   pub model: String,
   pub updated_at: i64,
   pub turns: Vec<GeminiTurn>,
@@ -1127,8 +1611,11 @@ pub struct GeminiChatListItem {
 }
 
 #[tauri::command]
-fn list_gemini_chats(app: tauri::AppHandle) -> Result<Vec<GeminiChatListItem>, String> {
-  let dir = gemini_chats_dir(&app)?;
+fn list_gemini_chats(app: tauri::AppHandle, provider: String) -> Result<Vec<GeminiChatListItem>, String> {
+  if provider != "gemini" && provider != "gpt" {
+    return Err("invalid provider".to_string());
+  }
+  let dir = ai_chats_dir_for_provider(&app, &provider)?;
   let read = match fs::read_dir(&dir) {
     Ok(r) => r,
     Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
@@ -1156,8 +1643,11 @@ fn list_gemini_chats(app: tauri::AppHandle) -> Result<Vec<GeminiChatListItem>, S
 }
 
 #[tauri::command]
-fn load_gemini_chat(app: tauri::AppHandle, id: String) -> Result<GeminiChatFile, String> {
-  let dir = gemini_chats_dir(&app)?;
+fn load_gemini_chat(app: tauri::AppHandle, id: String, provider: String) -> Result<GeminiChatFile, String> {
+  if provider != "gemini" && provider != "gpt" {
+    return Err("invalid provider".to_string());
+  }
+  let dir = ai_chats_dir_for_provider(&app, &provider)?;
   let p = chat_path(&dir, &id)?;
   if !p.is_file() {
     return Err("chat not found".to_string());
@@ -1170,25 +1660,45 @@ fn load_gemini_chat(app: tauri::AppHandle, id: String) -> Result<GeminiChatFile,
 fn save_gemini_conversation(
   app: tauri::AppHandle,
   id: String,
+  provider: String,
   title: String,
   model: String,
   turns: Vec<GeminiTurn>,
 ) -> Result<(), String> {
-  if !GEMINI_MODEL_ALLOWLIST.contains(&model.as_str()) {
-    return Err("unsupported model".to_string());
-  }
-  let dir = gemini_chats_dir(&app)?;
+  validate_model_for_provider(&provider, &model)?;
+  let dir = ai_chats_dir_for_provider(&app, &provider)?;
   let p = chat_path(&dir, &id)?;
   for t in &turns {
     if t.role != "user" && t.role != "model" {
       return Err("invalid turn role in saved chat".to_string());
     }
   }
+  let title = title.trim().to_string();
+  let touch_time = if p.is_file() {
+    let s = fs::read_to_string(&p).map_err(|e| e.to_string())?;
+    if let Ok(prev) = serde_json::from_str::<GeminiChatFile>(&s) {
+      if prev.id == id
+        && prev.provider == provider
+        && prev.model == model
+        && prev.title == title
+        && prev.turns == turns
+      {
+        prev.updated_at
+      } else {
+        now_secs()
+      }
+    } else {
+      now_secs()
+    }
+  } else {
+    now_secs()
+  };
   let file = GeminiChatFile {
     id: id.clone(),
-    title: title.trim().to_string(),
+    title,
+    provider,
     model,
-    updated_at: now_secs(),
+    updated_at: touch_time,
     turns,
   };
   let s = serde_json::to_string_pretty(&file).map_err(|e| e.to_string())?;
@@ -1197,14 +1707,20 @@ fn save_gemini_conversation(
 }
 
 #[tauri::command]
-fn new_gemini_chat(app: tauri::AppHandle) -> Result<String, String> {
+fn new_gemini_chat(app: tauri::AppHandle, provider: String) -> Result<String, String> {
+  let (def_model, prov) = match provider.as_str() {
+    "gpt" => ("gpt-5.4", "gpt"),
+    "gemini" => ("gemini-2.5-flash", "gemini"),
+    _ => return Err("invalid provider".to_string()),
+  };
   let id = Uuid::new_v4().to_string();
-  let dir = gemini_chats_dir(&app)?;
+  let dir = ai_chats_dir_for_provider(&app, prov)?;
   let p = chat_path(&dir, &id)?;
   let file = GeminiChatFile {
     id: id.clone(),
     title: "New chat".to_string(),
-    model: "gemini-2.5-flash".to_string(),
+    provider: prov.to_string(),
+    model: def_model.to_string(),
     updated_at: now_secs(),
     turns: vec![],
   };
@@ -1214,8 +1730,11 @@ fn new_gemini_chat(app: tauri::AppHandle) -> Result<String, String> {
 }
 
 #[tauri::command]
-fn delete_gemini_chat_file(app: tauri::AppHandle, id: String) -> Result<(), String> {
-  let dir = gemini_chats_dir(&app)?;
+fn delete_gemini_chat_file(app: tauri::AppHandle, id: String, provider: String) -> Result<(), String> {
+  if provider != "gemini" && provider != "gpt" {
+    return Err("invalid provider".to_string());
+  }
+  let dir = ai_chats_dir_for_provider(&app, &provider)?;
   let p = chat_path(&dir, &id)?;
   if p.is_file() {
     fs::remove_file(&p).map_err(|e| e.to_string())?;
@@ -1260,7 +1779,15 @@ pub fn run() {
       stop_sandbox,
       save_gemini_api_key,
       gemini_key_configured,
+      save_openai_api_key,
+      openai_key_configured,
+      save_pixellab_api_key,
+      pixellab_key_configured,
+      pixellab_v2_get,
+      pixellab_v2_post,
+      write_project_asset_bytes,
       gemini_start_stream,
+      openai_start_stream,
       list_gemini_chats,
       load_gemini_chat,
       save_gemini_conversation,
