@@ -16,13 +16,14 @@ struct RunnerState {
   child: Mutex<Option<Arc<SharedChild>>>,
 }
 
-const DEFAULT_MAIN_PY: &str = r#"# Pygame + pygame — files load from the same folder as this script.
-# e.g. pygame.image.load("sprite.png") next to main.py
+const DEFAULT_MAIN_PY: &str = r#"# python.game — added assets are next to this file (same folder as Run's cwd).
+# Pygame: pygame.image.load("sprite.png")
+# Turtle:  open files by name; built-in image shapes and bgpic() use .gif. Optional: asset_path("x.gif")
 import pygame
 
 pygame.init()
 screen = pygame.display.set_mode((400, 300))
-pygame.display.set_caption("Pygame Coding Sandbox")
+pygame.display.set_caption("python.game")
 clock = pygame.time.Clock()
 running = True
 while running:
@@ -338,13 +339,33 @@ fn spawn_wait_thread(app: tauri::AppHandle, child: Arc<SharedChild>) {
   });
 }
 
+/// Spawning a game window (pygame, turtle, etc.) next to a **native fullscreen** IDE “loses”
+/// the Tauri window: macOS leaves fullscreen on another space, or the app is minimized. We only
+/// exit fullscreen / restore a minimized or hidden host window — we do **not** always `show` the
+/// IDE, and we do not schedule delayed `show` calls: those were raising the z-order of the
+/// Tauri window *after* a slow child window (e.g. Tk after loading a multi-frame GIF) had
+/// appeared, which left the game window **behind** the IDE.
+fn resurface_ide_for_child_process(app: &tauri::AppHandle) {
+  let Some(w) = app.get_webview_window("main") else {
+    return;
+  };
+  if w.is_fullscreen().unwrap_or(false) {
+    let _ = w.set_fullscreen(false);
+  }
+  if w.is_minimized().unwrap_or(false) {
+    let _ = w.unminimize();
+  } else if !w.is_visible().unwrap_or(true) {
+    let _ = w.show();
+  }
+}
+
 fn run_inner(app: &tauri::AppHandle, state: &Arc<RunnerState>) -> Result<(), String> {
   stop_child(state)?;
 
   emit_line(
     app,
     "info",
-    "Starting local Python (project folder = cwd for your files)…",
+    "Starting Python (project folder = cwd; ASSET_DIR & asset_path() available)…",
   );
   let base = app_workspace_dir(app)?;
   write_bootstrap_files(&base)?;
@@ -398,6 +419,8 @@ fn run_inner(app: &tauri::AppHandle, state: &Arc<RunnerState>) -> Result<(), Str
   spawn_log_thread(h2, "stderr", err);
   let h3 = app.clone();
   spawn_wait_thread(h3, Arc::clone(&shared));
+
+  resurface_ide_for_child_process(app);
 
   Ok(())
 }
@@ -633,9 +656,9 @@ fn export_active_game(app: tauri::AppHandle, parent_path: String) -> Result<Expo
   let uline: String = (0..uline_len).map(|_| '=').collect();
   let mut readm = format!("{}\n{}\n\n", ag.name, uline);
   readm.push_str(
-    "Contents\n  main.py                 — your game (Python / pygame)\n  export_manifest.json   — project name + list of other files in this folder\n  run.sh / run.bat        — start (or: python3 main.py from this folder)\n\n",
+    "Contents\n  main.py                 — your code (e.g. pygame, turtle, stdlib)\n  export_manifest.json   — project name + list of other files in this folder\n  run.sh / run.bat        — start (or: python3 main.py from this folder)\n\n",
   );
-  readm.push_str("How to play\n  1)  python3 -m pip install pygame\n  2)  From this folder:  python3 main.py   (or double-click run.bat on Windows)\n\n");
+  readm.push_str("How to play\n  1)  Optional: python3 -m pip install pygame  (turtle is in the stdlib)\n  2)  From this folder:  python3 main.py   (or double-click run.bat on Windows)\n\n");
   readm.push_str("Other game files in this folder (load by filename, same as in your code):\n");
   if names.is_empty() {
     readm.push_str("  (none)\n");
@@ -652,7 +675,7 @@ fn export_active_game(app: tauri::AppHandle, parent_path: String) -> Result<Expo
 cd "$(dirname "$0")" || exit 1
 if command -v python3 >/dev/null 2>&1; then exec python3 main.py; fi
 if command -v python >/dev/null 2>&1; then exec python main.py; fi
-echo "Install Python 3, then: python3 -m pip install pygame"
+echo "Install Python 3, then: python3 -m pip install pygame  # optional, for pygame"
 exit 1
 "#;
   let shp = out_root.join("run.sh");
@@ -672,7 +695,7 @@ cd /d "%~dp0"
 where python3 >nul 2>&1 && python3 main.py & goto :done
 where python >nul 2>&1 && python main.py & goto :done
 where py >nul 2>&1 && py -3 main.py & goto :done
-echo Install Python 3, then: pip install pygame
+echo Install Python 3, then: pip install pygame  ^(optional for pygame; turtle is built in^)
 pause
 :done
 "#;

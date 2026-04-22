@@ -1,5 +1,5 @@
 ================================================================================
-  Pygame Coding Sandbox — Windows (Cursor) setup
+  python.game — Windows (Cursor) setup
 ================================================================================
 
 WHAT PASTING THE GITHUB LINK DOES
@@ -39,9 +39,9 @@ TO BUILD A WINDOWS INSTALLER (for download links, etc.)
   Use the .exe / .msi / nsis from there as your Windows download (after
   you test the build).
 
-PYGAME
-  The app runs your `main.py` with the `python` on PATH. Install pygame
-  once in that Python:
+PYTHON + PYGAME
+  The app runs your `main.py` with the `python` on PATH. The `turtle` module
+  is in the stdlib. For the default template that uses pygame, install once:
 
     python -m pip install pygame
 

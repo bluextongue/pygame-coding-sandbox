@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "pygame-coding-sandbox",
+  "productName": "python.game",
   "version": "0.1.0",
-  "identifier": "com.pygame.sandbox",
+  "identifier": "com.python.game",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -13,7 +13,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "Pygame Coding Sandbox",
+        "title": "python.game",
         "width": 1280,
         "height": 800,
         "dragDropEnabled": true

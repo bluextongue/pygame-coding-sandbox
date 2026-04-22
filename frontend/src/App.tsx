@@ -15,13 +15,14 @@ type RunnerLinePayload = { stream: string; line: string };
 type GameInfo = { id: string; name: string };
 type ExportResult = { path: string; label: string };
 
-const defaultCode = `# Pygame + pygame — files you add are stored next to main.py; load by filename.
-# Example: pygame.image.load("sprite.png")
+const defaultCode = `# python.game — files you add in the app are next to main.py; Run uses that folder as cwd.
+# Pygame: pygame.image.load("sprite.png")
+# Turtle:  use filenames; built-in image shapes and bgpic() need .gif — or try asset_path("sheet.gif")
 import pygame
 
 pygame.init()
 screen = pygame.display.set_mode((400, 300))
-pygame.display.set_caption("Pygame Coding Sandbox")
+pygame.display.set_caption("python.game")
 clock = pygame.time.Clock()
 running = True
 while running:
@@ -783,6 +784,8 @@ export default function App() {
           open={geminiOpen}
           onClose={() => setGeminiOpen(false)}
           onSendCodeToEditor={applyGeminiCodeToEditor}
+          onRunFromAi={isTauri() ? run : undefined}
+          running={running}
         />
       </div>
 

@@ -82,6 +82,51 @@ function extractFrameBase64s(root: unknown): string[] {
   return found;
 }
 
+function normalizeFrameObjectToDataUrl(item: unknown): string | null {
+  if (item == null || typeof item !== "object") return null;
+  const r = item as Record<string, unknown>;
+  if (typeof r.base64 === "string") {
+    const b = r.base64.trim();
+    if (b.length < 20) return null;
+    return b.startsWith("data:") ? b : `data:image/png;base64,${b}`;
+  }
+  const img = r.image;
+  if (img && typeof img === "object") {
+    const ib = (img as { base64?: string }).base64;
+    if (typeof ib === "string" && ib.trim().length >= 20) {
+      const t = ib.trim();
+      return t.startsWith("data:") ? t : `data:image/png;base64,${t}`;
+    }
+  }
+  return null;
+}
+
+/**
+ * completed `animate-with-text-v3` jobs include a `frames` array plus an echoed `first_frame`;
+ * {@link extractFrameBase64s} walks the whole tree and collects both, yielding one extra cell.
+ */
+function extractAnimateV3FramesForSheet(root: unknown): string[] {
+  if (root && typeof root === "object") {
+    const o = root as Record<string, unknown>;
+    const lists: unknown[] = [
+      o.frames,
+      (o.result as Record<string, unknown> | undefined)?.frames,
+      (o.output as Record<string, unknown> | undefined)?.frames,
+      (o.data as Record<string, unknown> | undefined)?.frames,
+    ];
+    for (const arr of lists) {
+      if (!Array.isArray(arr) || arr.length === 0) continue;
+      const out: string[] = [];
+      for (const item of arr) {
+        const u = normalizeFrameObjectToDataUrl(item);
+        if (u) out.push(u);
+      }
+      if (out.length > 0) return out;
+    }
+  }
+  return extractFrameBase64s(root);
+}
+
 async function loadImageEl(src: string): Promise<HTMLImageElement> {
   return new Promise((resolve, reject) => {
     const im = new Image();
@@ -371,9 +416,16 @@ export function PixelLabPanel({ open, onClose, onAssetsChanged, projectAssets = 
         setErr(String(pMotion.error || pMotion.message || pMotion.detail || "Animation job did not complete."));
         return;
       }
-      const frames = extractFrameBase64s(payload ?? {});
+      const rawFrames = extractAnimateV3FramesForSheet(payload ?? {});
+      const frames = rawFrames.slice(0, fc);
       if (frames.length === 0) {
         setErr("Job finished but no frames were found in the response. See debug JSON below.");
+        return;
+      }
+      if (frames.length < fc) {
+        setErr(
+          `Job returned ${rawFrames.length} frame(s); need ${fc}. If this persists, check the debug JSON below.`,
+        );
         return;
       }
       const sheet = await stitchFramesHorizontalPng(frames);

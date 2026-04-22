@@ -42,11 +42,27 @@ type ModelMsgProps = {
   copyFlashKey: string | null;
   onCopy: (t: string, key: string) => void;
   onSendToEditor: ((key: string, code: string) => void) | undefined;
-  editorToEditorFlash: string | null;
+  /** Chat-scoped id so the same block index in a different chat is distinct. */
+  chatId: string;
+  sentToEditorKeys: Readonly<Record<string, true>>;
+  /** Tauri: run main.py (after this block was sent to the editor). */
+  onRunFromAi: (() => void | Promise<void>) | undefined;
+  running: boolean;
   assistantLabel: string;
 };
 
-function GeminiModelMessage({ text, turnIndex, copyFlashKey, onCopy, onSendToEditor, editorToEditorFlash, assistantLabel }: ModelMsgProps) {
+function GeminiModelMessage({
+  text,
+  turnIndex,
+  copyFlashKey,
+  onCopy,
+  onSendToEditor,
+  chatId,
+  sentToEditorKeys,
+  onRunFromAi,
+  running,
+  assistantLabel,
+}: ModelMsgProps) {
   const segments = useMemo(() => parseMarkdownFences(text), [text]);
   const hasFencedCode = segments.some((s) => s.kind === "code");
 
@@ -78,7 +94,10 @@ function GeminiModelMessage({ text, turnIndex, copyFlashKey, onCopy, onSendToEdi
               </div>
             );
           }
-          const ck = `${turnIndex}-b${j}`;
+          const ck = `${chatId}-${turnIndex}-b${j}`;
+          const codeNorm = seg.value.replace(/\r\n/g, "\n");
+          const sentHere = sentToEditorKeys[ck] === true;
+          const showRun = isTauri() && onRunFromAi && sentHere;
           return (
             <div key={j} className="gemini-code-wrap">
               <div className="gemini-code-blk-hdr">
@@ -98,16 +117,36 @@ function GeminiModelMessage({ text, turnIndex, copyFlashKey, onCopy, onSendToEdi
                   >
                     {copyFlashKey === ck ? "Copied" : "Copy code"}
                   </button>
-                  {onSendToEditor && (
-                    <button
-                      type="button"
-                      className="win-link-btn"
-                      onClick={() => onSendToEditor(ck, seg.value.replace(/\r\n/g, "\n"))}
-                      title="Replace the Code (main.py) buffer with this block and save to disk in the Tauri app"
-                    >
-                      {editorToEditorFlash === ck ? "Sent" : "To editor"}
-                    </button>
-                  )}
+                  {onSendToEditor &&
+                    (showRun ? (
+                      <button
+                        type="button"
+                        className="win-link-btn"
+                        disabled={running}
+                        onClick={() => {
+                          void onRunFromAi?.();
+                        }}
+                        title="Save main.py if needed, then run (same as Run in the toolbar)"
+                      >
+                        Run
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        className="win-link-btn"
+                        disabled={!isTauri() && sentHere}
+                        onClick={() => {
+                          if (!sentHere) onSendToEditor(ck, codeNorm);
+                        }}
+                        title={
+                          isTauri()
+                            ? "Replace main.py with this block and save"
+                            : "Update the on-screen code (browser; no Tauri write)"
+                        }
+                      >
+                        {!isTauri() && sentHere ? "Sent" : "To editor"}
+                      </button>
+                    ))}
                 </div>
               </div>
               <pre className="gemini-code-blk">
@@ -258,9 +297,13 @@ type Props = {
   onClose: () => void;
   /** Replace main.py in the app editor with a fenced code block. */
   onSendCodeToEditor?: (code: string) => void;
+  /** Tauri: after “To editor”, the same slot shows Run — same behavior as the toolbar Run. */
+  onRunFromAi?: () => void | Promise<void>;
+  /** Disables the Run control while a run is in progress. */
+  running?: boolean;
 };
 
-export function GeminiPanel({ open, onClose, onSendCodeToEditor }: Props) {
+export function GeminiPanel({ open, onClose, onSendCodeToEditor, onRunFromAi, running = false }: Props) {
   const [provider, setProvider] = useState<AiProvider>("gemini");
   const [model, setModel] = useState(GEMINI_MODELS[0].id);
   const [keyInput, setKeyInput] = useState("");
@@ -275,7 +318,7 @@ export function GeminiPanel({ open, onClose, onSendCodeToEditor }: Props) {
   const [streamText, setStreamText] = useState("");
   const [err, setErr] = useState<string | null>(null);
   const [copyFlashKey, setCopyFlashKey] = useState<string | null>(null);
-  const [editorToEditorFlash, setEditorToEditorFlash] = useState<string | null>(null);
+  const [sentToEditorKeys, setSentToEditorKeys] = useState<Record<string, true>>({});
   const scrollRef = useRef<HTMLDivElement>(null);
   const streamAccRef = useRef("");
   const lastUserTextRef = useRef("");
@@ -327,6 +370,10 @@ export function GeminiPanel({ open, onClose, onSendCodeToEditor }: Props) {
   }, [refreshKeyState]);
 
   const assistantLabel = provider === "gemini" ? "Gemini" : "GPT";
+
+  useEffect(() => {
+    setSentToEditorKeys({});
+  }, [activeChatId]);
 
   // Load or create a saved session — first time the panel is opened (avoids work until needed).
   useEffect(() => {
@@ -740,11 +787,7 @@ export function GeminiPanel({ open, onClose, onSendCodeToEditor }: Props) {
   const sendCodeToEditor = useCallback(
     (key: string, code: string) => {
       onSendCodeToEditor?.(code);
-      setEditorToEditorFlash(key);
-      window.setTimeout(
-        () => setEditorToEditorFlash((k) => (k === key ? null : k)),
-        1500,
-      );
+      setSentToEditorKeys((p) => ({ ...p, [key]: true }));
     },
     [onSendCodeToEditor],
   );
@@ -1200,7 +1243,10 @@ export function GeminiPanel({ open, onClose, onSendCodeToEditor }: Props) {
                         copyFlashKey={copyFlashKey}
                         onCopy={flashCopy}
                         onSendToEditor={onSendCodeToEditor ? sendCodeToEditor : undefined}
-                        editorToEditorFlash={editorToEditorFlash}
+                        chatId={activeChatId ?? ""}
+                        sentToEditorKeys={sentToEditorKeys}
+                        onRunFromAi={onRunFromAi}
+                        running={running}
                         assistantLabel={assistantLabel}
                       />
                     )}
