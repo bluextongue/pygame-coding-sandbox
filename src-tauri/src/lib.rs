@@ -345,6 +345,12 @@ fn spawn_wait_thread(app: tauri::AppHandle, child: Arc<SharedChild>) {
 /// IDE, and we do not schedule delayed `show` calls: those were raising the z-order of the
 /// Tauri window *after* a slow child window (e.g. Tk after loading a multi-frame GIF) had
 /// appeared, which left the game window **behind** the IDE.
+///
+/// On **macOS**, do **not** `unminimize` / `show` the host: that re-activates the app and the
+/// WebView becomes the key window, while turtle runs in a **separate** Python+Tk process. The
+/// user would get **no key events in the game** (they all go to the editor). Exiting
+/// fullscreen so the user can see the desktop is enough; if the host was minimized, they can
+/// restore it from the dock.
 fn resurface_ide_for_child_process(app: &tauri::AppHandle) {
   let Some(w) = app.get_webview_window("main") else {
     return;
@@ -352,10 +358,38 @@ fn resurface_ide_for_child_process(app: &tauri::AppHandle) {
   if w.is_fullscreen().unwrap_or(false) {
     let _ = w.set_fullscreen(false);
   }
-  if w.is_minimized().unwrap_or(false) {
-    let _ = w.unminimize();
-  } else if !w.is_visible().unwrap_or(true) {
-    let _ = w.show();
+  #[cfg(target_os = "macos")]
+  {
+    return;
+  }
+  #[cfg(not(target_os = "macos"))]
+  {
+    if w.is_minimized().unwrap_or(false) {
+      let _ = w.unminimize();
+    } else if !w.is_visible().unwrap_or(true) {
+      let _ = w.show();
+    }
+  }
+}
+
+/// Windows: the host process (this app) had the last user input (Run), so a spawned child is not
+/// allowed to call `SetForegroundWindow` for its Tk/turtle (or SDL) window unless we explicitly
+/// allow it. Without this, the game can render but has no keyboard.
+#[cfg(windows)]
+mod win_allow_child_fg {
+  #[link(name = "user32", kind = "system")]
+  extern "system" {
+    pub(crate) fn AllowSetForegroundWindow(id: u32) -> i32;
+  }
+}
+
+#[cfg(windows)]
+fn allow_set_foreground_for_child_process(child_pid: u32) {
+  if child_pid == 0 {
+    return;
+  }
+  unsafe {
+    let _ = win_allow_child_fg::AllowSetForegroundWindow(child_pid);
   }
 }
 
@@ -400,6 +434,8 @@ fn run_inner(app: &tauri::AppHandle, state: &Arc<RunnerState>) -> Result<(), Str
   }
 
   let shared = SharedChild::spawn(&mut cmd).map_err(|e| e.to_string())?;
+  #[cfg(windows)]
+  allow_set_foreground_for_child_process(shared.id());
   let out = shared
     .take_stdout()
     .ok_or_else(|| "no stdout on child process".to_string())?;

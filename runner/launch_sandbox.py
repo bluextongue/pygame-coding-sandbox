@@ -37,7 +37,9 @@ def _install_turtle_to_front() -> None:
         return
       root = cv.winfo_toplevel()
 
-      def one() -> None:
+      def one(first: bool) -> None:
+        # Retries (80ms+): do not `focus_force` the root; that runs after
+        # `Screen.listen()` and steals focus from the canvas where onkey is bound.
         try:
           root.lift()
         except (TclError, TypeError, ValueError, RuntimeError, OSError):
@@ -56,10 +58,11 @@ def _install_turtle_to_front() -> None:
           root.after(80, _un_top)
         except TclError:
           pass
-        try:
-          root.focus_force()
-        except (TclError, Exception):
-          pass
+        if first:
+          try:
+            root.focus_force()
+          except (TclError, Exception):
+            pass
         if sys.platform == "darwin":
           try:
             pid = str(os.getpid())
@@ -77,22 +80,36 @@ def _install_turtle_to_front() -> None:
           except (FileNotFoundError, subprocess.SubprocessError, OSError, ValueError, TypeError):
             pass
         elif sys.platform == "win32":
-          try:
-            import ctypes
-            hw = int(root.winfo_id())
-            ctypes.windll.user32.SetForegroundWindow(hw)  # best-effort; may be ignored by policy
-          except (OSError, ValueError, TypeError, AttributeError, ImportError, Exception):
-            pass
+          # HWND is pointer-sized: pass a full-width handle (parent must call
+          # AllowSetForegroundWindow(child_pid) so this is not ignored by the OS).
+          if first:
+            try:
+              import ctypes
+              from ctypes import wintypes
+
+              u32 = ctypes.windll.user32
+              u32.SetForegroundWindow.argtypes = (wintypes.HWND,)
+              u32.SetForegroundWindow.restype = wintypes.BOOL
+              u32.SetForegroundWindow(wintypes.HWND(int(root.winfo_id())))
+            except (OSError, ValueError, TypeError, AttributeError, ImportError, Exception):
+              pass
+        # Keys go to the turtle canvas, not the root — always, including after
+        # delayed runs that only need to re-lift a slow-mapped window.
+        try:
+          cv.focus_set()
+        except (TclError, TypeError, ValueError, RuntimeError, OSError):
+          pass
 
       # Same tick + later — child window can map only after a long setup (GIF frame loop).
-      for delay in (0, 80, 400, 1200):
+      for i, delay in enumerate((0, 80, 400, 1200)):
+        first = i == 0
         if delay:
           try:
-            root.after(delay, one)
+            root.after(delay, lambda f=first: one(f))
           except TclError:
             break
         else:
-          one()
+          one(first)
     except (AttributeError, Exception):
       return
 
