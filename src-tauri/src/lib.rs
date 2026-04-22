@@ -30,7 +30,8 @@ while running:
   for event in pygame.event.get():
     if event.type == pygame.QUIT:
       running = False
-  screen.fill((30, 30, 40))
+  screen.fill((18, 24, 40))
+  pygame.draw.circle(screen, (80, 200, 120), (200, 150), 48)
   pygame.display.flip()
   clock.tick(60)
 pygame.quit()
