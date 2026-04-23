@@ -408,7 +408,7 @@ fn resurface_ide_for_child_process(app: &tauri::AppHandle) {
 /// allow it. Without this, the game can render but has no keyboard.
 #[cfg(windows)]
 mod win_allow_child_fg {
-  #[link(name = "user32", kind = "system")]
+  #[link(name = "user32")]
   extern "system" {
     pub(crate) fn AllowSetForegroundWindow(id: u32) -> i32;
   }
