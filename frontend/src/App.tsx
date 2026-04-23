@@ -5,6 +5,7 @@ import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import Editor, { type OnChange } from "@monaco-editor/react";
 import { GeminiPanel } from "./GeminiPanel";
+import { MidjourneyPanel } from "./MidjourneyPanel";
 import { PixelLabPanel } from "./PixelLabPanel";
 
 const AUTOSAVE_MS = 600;
@@ -252,6 +253,7 @@ export default function App() {
   const [exportDone, setExportDone] = useState<ExportResult | null>(null);
   const [geminiOpen, setGeminiOpen] = useState(false);
   const [pixelLabOpen, setPixelLabOpen] = useState(false);
+  const [midjourneyOpen, setMidjourneyOpen] = useState(false);
   const projectMenuRef = useRef<HTMLDivElement>(null);
 
   const codeRef = useRef(code);
@@ -605,7 +607,15 @@ export default function App() {
   }, [projectMenuOpen]);
 
   useEffect(() => {
-    if (!floatKind && !deleteTarget && !projectMenuOpen && !exportDone && !geminiOpen && !pixelLabOpen)
+    if (
+      !floatKind &&
+      !deleteTarget &&
+      !projectMenuOpen &&
+      !exportDone &&
+      !geminiOpen &&
+      !pixelLabOpen &&
+      !midjourneyOpen
+    )
       return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
@@ -615,11 +625,12 @@ export default function App() {
         setExportDone(null);
         setGeminiOpen(false);
         setPixelLabOpen(false);
+        setMidjourneyOpen(false);
       }
     };
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
-  }, [floatKind, deleteTarget, projectMenuOpen, exportDone, geminiOpen, pixelLabOpen]);
+  }, [floatKind, deleteTarget, projectMenuOpen, exportDone, geminiOpen, pixelLabOpen, midjourneyOpen]);
 
   return (
     <div className="app">
@@ -705,6 +716,16 @@ export default function App() {
           </div>
         )}
 
+        <button
+          type="button"
+          className="gemini-btn"
+          onClick={() => setGeminiOpen(true)}
+          title="Open AI: Google Gemini or OpenAI GPT — keys and chat in the app backend"
+          aria-label="Open AI panel"
+        >
+          AI
+        </button>
+
         {isTauri() && (
           <button
             type="button"
@@ -717,15 +738,17 @@ export default function App() {
           </button>
         )}
 
-        <button
-          type="button"
-          className="gemini-btn"
-          onClick={() => setGeminiOpen(true)}
-          title="Open AI: Google Gemini or OpenAI GPT — keys and chat in the app backend"
-          aria-label="Open AI panel"
-        >
-          AI
-        </button>
+        {isTauri() && (
+          <button
+            type="button"
+            className="gemini-btn"
+            onClick={() => setMidjourneyOpen(true)}
+            title="Midjourney — text-to-image via WaveSpeed API (wavespeed.ai)"
+            aria-label="Open Midjourney"
+          >
+            Midjourney
+          </button>
+        )}
 
         <div className="top-bar-actions" role="group" aria-label="Run controls">
           <button
@@ -766,12 +789,13 @@ export default function App() {
         />
       )}
 
-      {(geminiOpen || pixelLabOpen) && (
+      {(geminiOpen || pixelLabOpen || midjourneyOpen) && (
         <div
           className="set-float-back"
           onMouseDown={() => {
             setGeminiOpen(false);
             setPixelLabOpen(false);
+            setMidjourneyOpen(false);
           }}
         />
       )}
@@ -800,6 +824,18 @@ export default function App() {
           onClose={() => setPixelLabOpen(false)}
           onAssetsChanged={refreshAssets}
           projectAssets={assets}
+        />
+      </div>
+
+      <div
+        className="set-float"
+        style={{ zIndex: 122, display: midjourneyOpen && isTauri() ? "flex" : "none" }}
+        aria-hidden={!midjourneyOpen}
+      >
+        <MidjourneyPanel
+          open={midjourneyOpen}
+          onClose={() => setMidjourneyOpen(false)}
+          onAssetsChanged={refreshAssets}
         />
       </div>
 

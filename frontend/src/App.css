@@ -715,31 +715,53 @@ button.ai-pnv-btn.is-on {
   min-width: 0;
 }
 
+.gemini-copy-all-btn {
+  font-size: 11px;
+  padding: 1px 6px;
+}
+
+.gemini-code-action-btn {
+  font-size: 10px;
+  padding: 1px 5px;
+}
+
+.gemini-msg-body--streaming {
+  position: relative;
+}
+
+.gemini-msg-body--streaming .gemini-stream-cursor {
+  display: inline-block;
+  margin-left: 2px;
+  vertical-align: text-bottom;
+}
+
 .gemini-code-wrap {
   min-width: 0;
-  border: 2px solid;
-  border-color: #404040 #dfdfdf #dfdfdf #404040;
-  background: #e8e4e0;
+  border: 1px solid #808080;
+  border-radius: 2px;
+  background: #f0ece8;
+  box-shadow: 1px 1px 0 #fff inset, -1px -1px 0 #b0b0b0 inset;
 }
 
 .gemini-code-blk-hdr {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
-  padding: 2px 6px 3px 6px;
-  background: #c0c0c0;
-  border-bottom: 1px solid #a0a0a0;
+  gap: 6px;
+  padding: 3px 6px;
+  min-height: 22px;
+  background: linear-gradient(180deg, #d8d8d8 0%, #c4c4c4 100%);
+  border-bottom: 1px solid #909090;
 }
 
 .gemini-code-blk-btns {
   display: flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   align-items: center;
   justify-content: flex-end;
-  gap: 4px 6px;
+  gap: 4px;
   flex: 0 0 auto;
-  max-width: 100%;
+  max-width: 58%;
 }
 
 .gemini-code-lang {
@@ -1226,15 +1248,27 @@ button.ai-pnv-btn.is-on {
   color: #505050;
 }
 
-/* PixelLab modal — same Win9x language as the rest */
-.pixel-lab-outer {
+/* Pixel Lab — floating frame like AI panel (fixed pos/size from JS; grips in shared .gemini-pnl-grip*) */
+.set-float .pixel-lab-pnl-outer {
   pointer-events: auto;
-  max-width: min(440px, calc(100vw - 24px));
-  width: 100%;
-  max-height: min(90vh, 640px);
+  box-sizing: border-box;
+  overflow: hidden;
   display: flex;
   flex-direction: column;
   min-height: 0;
+  min-width: 0;
+}
+
+.set-float .pixel-lab-pnl-outer .win-pop {
+  max-width: none;
+  width: 100%;
+  flex: 1 1 auto;
+  min-height: 0;
+  height: 100%;
+  max-height: none;
+  overflow: hidden;
+  position: relative;
+  z-index: 1;
 }
 
 .pixel-lab-win {
@@ -1252,6 +1286,17 @@ button.ai-pnv-btn.is-on {
   justify-content: space-between;
   gap: 8px;
   padding: 2px 4px 2px 8px;
+  flex-shrink: 0;
+  cursor: move;
+  min-height: 20px;
+}
+
+.pixel-lab-titletext {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .pixel-lab-head-actions {
@@ -1269,6 +1314,7 @@ button.ai-pnv-btn.is-on {
   gap: 4px;
   min-height: 0;
   overflow: auto;
+  flex: 1 1 auto;
 }
 
 .pixel-lab-keyrow {
@@ -1466,6 +1512,11 @@ label.pixel-lab-tgl:has(input:disabled) {
   margin: 2px 0 0 0;
 }
 
+/* Background-job polling: same slot/typography as .pixel-lab-status, calmer blue (no job id noise). */
+.pixel-lab-status-working {
+  color: #3465a4;
+}
+
 /* Checkerboard so transparent PNGs read clearly (matches typical pixel editors). */
 .pixel-lab-preview {
   margin-top: 8px;
@@ -1497,6 +1548,196 @@ label.pixel-lab-tgl:has(input:disabled) {
 }
 
 .pixel-lab-pre {
+  margin: 4px 0 0 0;
+  max-height: 10rem;
+  overflow: auto;
+  font-size: 9px;
+  line-height: 1.3;
+  background: #fff;
+  border: 1px solid #808080;
+  padding: 4px 6px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* Midjourney (WaveSpeed) — same floating shell + Win9x body as Pixel Lab */
+.set-float .midjourney-pnl-outer {
+  pointer-events: auto;
+  box-sizing: border-box;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+}
+
+.set-float .midjourney-pnl-outer .win-pop {
+  max-width: none;
+  width: 100%;
+  flex: 1 1 auto;
+  min-height: 0;
+  height: 100%;
+  max-height: none;
+  overflow: hidden;
+  position: relative;
+  z-index: 1;
+}
+
+.midjourney-win {
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  overflow: hidden;
+}
+
+.win-pop-head.midjourney-head {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 2px 4px 2px 8px;
+  flex-shrink: 0;
+  cursor: move;
+  min-height: 20px;
+}
+
+.midjourney-titletext {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.midjourney-head-actions {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.midjourney-body {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-height: 0;
+  overflow: auto;
+  flex: 1 1 auto;
+}
+
+.midjourney-hint {
+  margin: 6px 0 0 0;
+  font-size: 10px;
+  line-height: 1.4;
+  color: #404040;
+}
+
+.midjourney-keyrow {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: wrap;
+  gap: 4px;
+  align-items: center;
+}
+
+.midjourney-ta {
+  width: 100%;
+  resize: vertical;
+  min-height: 4.5rem;
+  font-family: Tahoma, "MS Sans Serif", sans-serif;
+  font-size: 11px;
+}
+
+.midjourney-grid2 {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px 10px;
+  margin-top: 4px;
+}
+
+.midjourney-grid3 {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 6px 8px;
+  margin-top: 4px;
+}
+
+input.midjourney-num {
+  max-width: 100%;
+}
+
+label.midjourney-tgl {
+  display: flex;
+  flex-direction: row;
+  align-items: flex-start;
+  gap: 6px;
+  font-size: 10px;
+  line-height: 1.35;
+  cursor: pointer;
+  user-select: none;
+}
+
+label.midjourney-tgl input {
+  margin: 2px 0 0 0;
+  flex-shrink: 0;
+}
+
+.midjourney-go {
+  margin-top: 8px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+
+.midjourney-err {
+  margin: 6px 0 0 0;
+  font-size: 10px;
+  color: #800000;
+}
+
+.midjourney-status {
+  font-size: 10px;
+  color: #000080;
+  margin: 2px 0 0 0;
+}
+
+.midjourney-status-working {
+  color: #3465a4;
+}
+
+.midjourney-preview {
+  margin-top: 8px;
+  padding: 4px;
+  background-color: #c0c0c0;
+  background-image: linear-gradient(45deg, #a8a8a8 25%, transparent 25%),
+    linear-gradient(-45deg, #a8a8a8 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #a8a8a8 75%),
+    linear-gradient(-45deg, transparent 75%, #a8a8a8 75%);
+  background-size: 12px 12px;
+  background-position: 0 0, 0 6px, 6px -6px, -6px 0;
+  border: 2px solid;
+  border-color: #404040 #dfdfdf #dfdfdf #404040;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+}
+
+.midjourney-preview-img {
+  max-width: 100%;
+  max-height: 220px;
+  object-fit: contain;
+}
+
+.midjourney-json {
+  margin-top: 6px;
+  font-size: 10px;
+}
+
+.midjourney-pre {
   margin: 4px 0 0 0;
   max-height: 10rem;
   overflow: auto;

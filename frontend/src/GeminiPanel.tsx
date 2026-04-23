@@ -8,30 +8,98 @@ import {
   type MouseEvent as ReactMouseEvent,
 } from "react";
 import { invoke, isTauri } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { initAiStreamListenersOnce, resetAiStreamHandlers, setAiStreamHandlerGetter } from "./aiStreamBridge";
 
 type Turn = { role: "user" | "model"; text: string };
 type AiProvider = "gemini" | "gpt";
 
-/** Split on GFM-style ``` ` fences (same pattern as most LLM outputs). */
-function parseMarkdownFences(s: string): { kind: "text" | "code"; value: string; info: string }[] {
-  const re = /```([^\n\r`]*?)\r?\n([\s\S]*?)```/g;
-  const out: { kind: "text" | "code"; value: string; info: string }[] = [];
-  let last = 0;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(s)) !== null) {
-    if (m.index > last) {
-      out.push({ kind: "text", value: s.slice(last, m.index), info: "" });
+type FenceSeg = { kind: "text" | "code"; value: string; info: string };
+
+/** e.g. corrupted "pythonpython" / "bashbash" from doubled stream chunks */
+function dedupeRepeatedFenceInfo(info: string): string {
+  const t = info.trim();
+  if (t.length < 2) return t;
+  const n = t.length;
+  for (let k = Math.floor(n / 2); k >= 1; k--) {
+    if (n % k !== 0) continue;
+    const unit = t.slice(0, k);
+    if (unit.repeat(n / k) === t) return unit;
+  }
+  return t;
+}
+
+/**
+ * GFM-style fenced blocks: only a *line* that is (≤3 spaces)(3+ fence chars)(optional info)
+ * can open/close. Code may contain ```…``` on inner lines without ending the block.
+ * This avoids the old regex `*?` bug that treated the first ``` inside JS/Python as the end.
+ */
+function parseMarkdownFences(raw: string): FenceSeg[] {
+  const lines = raw.split(/\r?\n/);
+  const out: FenceSeg[] = [];
+  let textLines: string[] = [];
+  let i = 0;
+
+  const flushText = () => {
+    if (textLines.length === 0) return;
+    const value = textLines.join("\n");
+    textLines = [];
+    if (value.length === 0) return;
+    const last = out[out.length - 1];
+    if (last?.kind === "text") {
+      last.value = `${last.value}\n${value}`;
+    } else {
+      out.push({ kind: "text", value, info: "" });
     }
-    out.push({ kind: "code", value: m[2] ?? "", info: (m[1] ?? "").trim() });
-    last = m.index + m[0].length;
+  };
+
+  const tryOpenFence = (line: string) => {
+    const m = line.match(/^(\s{0,3})(`{3,}|~{3,})(.*)$/);
+    if (!m) return null;
+    const tick = m[2];
+    const ch = tick[0] as "`" | "~";
+    const info = (m[3] ?? "").trim();
+    return { tickLen: tick.length, fenceChar: ch, info };
+  };
+
+  const tryCloseFence = (line: string, openTickLen: number, openCh: "`" | "~") => {
+    const m = line.match(/^(\s{0,3})(`{3,}|~{3,})\s*$/);
+    if (!m) return false;
+    const run = m[2];
+    if (run[0] !== openCh) return false;
+    return run.length >= openTickLen;
+  };
+
+  while (i < lines.length) {
+    const open = tryOpenFence(lines[i] ?? "");
+    if (open) {
+      flushText();
+      i++;
+      const codeLines: string[] = [];
+      let closed = false;
+      while (i < lines.length) {
+        const L = lines[i] ?? "";
+        if (tryCloseFence(L, open.tickLen, open.fenceChar)) {
+          closed = true;
+          i++;
+          break;
+        }
+        codeLines.push(L);
+        i++;
+      }
+      const code = codeLines.join("\n");
+      out.push({ kind: "code", value: code, info: dedupeRepeatedFenceInfo(open.info) });
+      if (!closed) {
+        /* EOF before closing fence — keep accumulated body as one block */
+      }
+      continue;
+    }
+    textLines.push(lines[i] ?? "");
+    i++;
   }
-  if (last < s.length) {
-    out.push({ kind: "text", value: s.slice(last), info: "" });
-  }
+  flushText();
   if (out.length === 0) {
-    return [{ kind: "text", value: s, info: "" }];
+    return [{ kind: "text", value: raw, info: "" }];
   }
   return out;
 }
@@ -49,6 +117,8 @@ type ModelMsgProps = {
   onRunFromAi: (() => void | Promise<void>) | undefined;
   running: boolean;
   assistantLabel: string;
+  /** Reply is still streaming; same fenced rendering as final, plus caret. */
+  streaming?: boolean;
 };
 
 function GeminiModelMessage({
@@ -62,6 +132,7 @@ function GeminiModelMessage({
   onRunFromAi,
   running,
   assistantLabel,
+  streaming = false,
 }: ModelMsgProps) {
   const segments = useMemo(() => parseMarkdownFences(text), [text]);
   const hasFencedCode = segments.some((s) => s.kind === "code");
@@ -73,19 +144,19 @@ function GeminiModelMessage({
         <div className="gemini-msg-actions">
           <button
             type="button"
-            className="win-link-btn"
-            onClick={() => onCopy(text, `all-${turnIndex}`)}
+            className="win-link-btn gemini-copy-all-btn"
+            onClick={() => void onCopy(text, `all-${turnIndex}`)}
             title={
               hasFencedCode
-                ? "Copy entire message (explanations and code, including markdown fences)"
-                : "Copy message"
+                ? "Copy entire reply (prose and code, including markdown fences)"
+                : "Copy entire reply"
             }
           >
-            {copyFlashKey === `all-${turnIndex}` ? "Copied" : hasFencedCode ? "Copy all" : "Copy"}
+            {copyFlashKey === `all-${turnIndex}` ? "Copied" : "Copy reply"}
           </button>
         </div>
       </div>
-      <div className="gemini-msg-body">
+      <div className={`gemini-msg-body${streaming ? " gemini-msg-body--streaming" : ""}`}>
         {segments.map((seg, j) => {
           if (seg.kind === "text") {
             return (
@@ -102,7 +173,7 @@ function GeminiModelMessage({
             <div key={j} className="gemini-code-wrap">
               <div className="gemini-code-blk-hdr">
                 {seg.info ? (
-                  <span className="gemini-code-lang" title="Language or tag after the code fence (e.g. python)">
+                  <span className="gemini-code-lang" title="Fence language / tag">
                     {seg.info}
                   </span>
                 ) : (
@@ -111,38 +182,35 @@ function GeminiModelMessage({
                 <div className="gemini-code-blk-btns">
                   <button
                     type="button"
-                    className="win-link-btn"
-                    onClick={() => onCopy(seg.value, ck)}
-                    title="Copy only this code block (no extra prose)"
+                    className="win-link-btn gemini-code-action-btn"
+                    onClick={() => void onCopy(seg.value, ck)}
+                    title="Copy this block only"
                   >
-                    {copyFlashKey === ck ? "Copied" : "Copy code"}
+                    {copyFlashKey === ck ? "Copied" : "Copy"}
                   </button>
                   {onSendToEditor &&
+                    !streaming &&
                     (showRun ? (
                       <button
                         type="button"
-                        className="win-link-btn"
+                        className="win-link-btn gemini-code-action-btn"
                         disabled={running}
                         onClick={() => {
                           void onRunFromAi?.();
                         }}
-                        title="Save main.py if needed, then run (same as Run in the toolbar)"
+                        title="Run main.py (toolbar Run)"
                       >
                         Run
                       </button>
                     ) : (
                       <button
                         type="button"
-                        className="win-link-btn"
+                        className="win-link-btn gemini-code-action-btn"
                         disabled={!isTauri() && sentHere}
                         onClick={() => {
                           if (!sentHere) onSendToEditor(ck, codeNorm);
                         }}
-                        title={
-                          isTauri()
-                            ? "Replace main.py with this block and save"
-                            : "Update the on-screen code (browser; no Tauri write)"
-                        }
+                        title={isTauri() ? "Write this block to main.py" : "Send to on-screen editor"}
                       >
                         {!isTauri() && sentHere ? "Sent" : "To editor"}
                       </button>
@@ -155,6 +223,11 @@ function GeminiModelMessage({
             </div>
           );
         })}
+        {streaming && (
+          <span className="gemini-stream-cursor" aria-hidden>
+            ▊
+          </span>
+        )}
       </div>
     </>
   );
@@ -675,53 +748,36 @@ export function GeminiPanel({ open, onClose, onSendCodeToEditor, onRunFromAi, ru
     setSending(false);
   }, []);
 
-  // Stream events — Gemini and OpenAI both use SSE from Rust
+  const onStreamDoneRef = useRef(onStreamDone);
+  const onStreamErrorRef = useRef(onStreamError);
+  onStreamDoneRef.current = onStreamDone;
+  onStreamErrorRef.current = onStreamError;
+
+  // One global Tauri `listen` registration (see aiStreamBridge.ts). Per-effect listeners could stack
+  // (Strict Mode, timing) and duplicate every chunk in the UI.
   useEffect(() => {
     if (!isTauri()) return;
-    let cancelled = false;
-    let disposers: (() => void)[] = [];
-    const onChunk = (e: { payload: unknown }) => {
-      if (cancelled) return;
-      const piece = e.payload;
-      if (typeof piece === "string" && piece.length) {
+    void initAiStreamListenersOnce();
+    return () => {
+      resetAiStreamHandlers();
+    };
+  }, []);
+
+  useLayoutEffect(() => {
+    if (!isTauri()) return;
+    setAiStreamHandlerGetter(() => ({
+      onChunk: (piece: string) => {
         streamAccRef.current += piece;
         setStreamText(streamAccRef.current);
-      }
-    };
-    const p = Promise.all([
-      listen<string>("gemini-stream-chunk", onChunk),
-      listen("gemini-stream-done", () => {
-        if (cancelled) return;
-        onStreamDone();
-      }),
-      listen<string>("gemini-stream-error", (e) => {
-        if (cancelled) return;
-        const msg = typeof e.payload === "string" ? e.payload : "stream error";
-        onStreamError(msg);
-      }),
-      listen<string>("openai-stream-chunk", onChunk),
-      listen("openai-stream-done", () => {
-        if (cancelled) return;
-        onStreamDone();
-      }),
-      listen<string>("openai-stream-error", (e) => {
-        if (cancelled) return;
-        const msg = typeof e.payload === "string" ? e.payload : "stream error";
-        onStreamError(msg);
-      }),
-    ]).then((unsubs) => {
-      if (cancelled) {
-        unsubs.forEach((u) => u());
-      } else {
-        disposers = unsubs;
-      }
-    });
-    return () => {
-      cancelled = true;
-      disposers.forEach((u) => u());
-      void p;
-    };
-  }, [onStreamDone, onStreamError]);
+      },
+      onDone: () => {
+        onStreamDoneRef.current();
+      },
+      onError: (msg: string) => {
+        onStreamErrorRef.current(msg);
+      },
+    }));
+  });
 
   const saveKey = useCallback(async () => {
     setErr(null);
@@ -828,9 +884,9 @@ export function GeminiPanel({ open, onClose, onSendCodeToEditor, onRunFromAi, ru
       });
       void refreshChats();
       if (provider === "gemini") {
-        await invoke("gemini_start_stream", { model, contents: historyPayload });
+        await invoke("gemini_start_stream", { model: m, contents: historyPayload });
       } else {
-        await invoke("openai_start_stream", { model, contents: historyPayload });
+        await invoke("openai_start_stream", { model: m, contents: historyPayload });
       }
     } catch (e) {
       setErr(String(e));
@@ -1254,13 +1310,19 @@ export function GeminiPanel({ open, onClose, onSendCodeToEditor, onRunFromAi, ru
                 ))}
                 {sending && (
                   <div className="gemini-msg gemini-msg-model">
-                    <span className="gemini-msg-who">{assistantLabel}</span>
-                    <div className="gemini-msg-txt">
-                      {streamText}
-                      <span className="gemini-stream-cursor" aria-hidden>
-                        ▊
-                      </span>
-                    </div>
+                    <GeminiModelMessage
+                      text={streamText}
+                      turnIndex={turns.length}
+                      copyFlashKey={copyFlashKey}
+                      onCopy={flashCopy}
+                      onSendToEditor={onSendCodeToEditor ? sendCodeToEditor : undefined}
+                      chatId={activeChatId ?? ""}
+                      sentToEditorKeys={sentToEditorKeys}
+                      onRunFromAi={onRunFromAi}
+                      running={running}
+                      assistantLabel={assistantLabel}
+                      streaming
+                    />
                   </div>
                 )}
               </div>

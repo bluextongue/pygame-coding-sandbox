@@ -4,7 +4,7 @@ use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use shared_child::SharedChild;
 use tauri::Emitter;
@@ -40,6 +40,36 @@ pygame.quit()
 const BOOTSTRAP_REL: &str = "sandbox_bootstrap.py";
 const GAMES_STATE: &str = "games_state.json";
 const GAMES_DIR: &str = "games";
+
+/// TCP/TLS connect timeout for outbound HTTP clients.
+const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
+/// PixelLab / WaveSpeed requests can run long (image jobs, polling). Not used for AI SSE streams.
+const HTTP_LONG_JOB_TIMEOUT: Duration = Duration::from_secs(3600);
+/// Keep long SSE reads from being dropped by NATs that expect periodic traffic.
+const HTTP_STREAM_TCP_KEEPALIVE: Duration = Duration::from_secs(30);
+/// Tauri IPC uses JSON; very large single events can stall or fail on some platforms.
+const AI_STREAM_EMIT_MAX_CHARS: usize = 16_384;
+
+fn emit_ai_stream_text(app: &tauri::AppHandle, event: &str, piece: &str) {
+  if piece.is_empty() {
+    return;
+  }
+  let mut rest = piece;
+  while !rest.is_empty() {
+    let n = if rest.len() <= AI_STREAM_EMIT_MAX_CHARS {
+      rest.len()
+    } else {
+      let mut end = AI_STREAM_EMIT_MAX_CHARS;
+      while end > 0 && !rest.is_char_boundary(end) {
+        end -= 1;
+      }
+      end
+    };
+    let (chunk, tail) = rest.split_at(n);
+    let _ = app.emit(event, chunk);
+    rest = tail;
+  }
+}
 
 fn sanitize_game_name(s: &str) -> String {
   let t = s.trim();
@@ -1075,7 +1105,8 @@ fn read_pixellab_api_key(app: &tauri::AppHandle) -> Result<String, String> {
 
 fn pixellab_http_client() -> Result<reqwest::blocking::Client, String> {
   reqwest::blocking::Client::builder()
-    .timeout(std::time::Duration::from_secs(300))
+    .connect_timeout(HTTP_CONNECT_TIMEOUT)
+    .timeout(HTTP_LONG_JOB_TIMEOUT)
     .build()
     .map_err(|e| e.to_string())
 }
@@ -1135,6 +1166,8 @@ const PIXELLAB_POST_PATHS: &[&str] = &[
   // Still + motion: image → animation (v3 returns a background job; poll for frames)
   "/animate-with-text-v3",
   "/create-tileset",
+  "/image-to-pixelart",
+  "/remove-background",
 ];
 
 fn pixellab_post_path_ok(path: &str) -> bool {
@@ -1192,6 +1225,161 @@ fn pixellab_v2_post(app: tauri::AppHandle, path: String, body: serde_json::Value
     return Err(format!("PixelLab HTTP {status}: {text}"));
   }
   Ok(text)
+}
+
+// ---- Midjourney text-to-image via WaveSpeed AI (https://api.wavespeed.ai/api/v3/...) ----
+// Midjourney does not publish a first-party HTTP API; WaveSpeed hosts a Midjourney model with a stable REST surface.
+
+const WAVESPEED_API_V3: &str = "https://api.wavespeed.ai/api/v3";
+
+fn midjourney_key_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+  let base = app.path().app_data_dir().map_err(|e| e.to_string())?;
+  Ok(base.join("midjourney_wavespeed_api_key"))
+}
+
+#[tauri::command]
+fn save_midjourney_api_key(app: tauri::AppHandle, key: String) -> Result<(), String> {
+  let key = key.trim();
+  let p = midjourney_key_path(&app)?;
+  if key.is_empty() {
+    if p.is_file() {
+      fs::remove_file(&p).map_err(|e| e.to_string())?;
+    }
+    return Ok(());
+  }
+  if let Some(parent) = p.parent() {
+    fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+  }
+  fs::write(&p, key.as_bytes()).map_err(|e| e.to_string())?;
+  #[cfg(unix)]
+  {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(m) = fs::metadata(&p) {
+      let mut perm = m.permissions();
+      perm.set_mode(0o600);
+      let _ = fs::set_permissions(&p, perm);
+    }
+  }
+  Ok(())
+}
+
+#[tauri::command]
+fn midjourney_key_configured(app: tauri::AppHandle) -> Result<bool, String> {
+  let p = midjourney_key_path(&app)?;
+  if !p.is_file() {
+    return Ok(false);
+  }
+  let s = fs::read_to_string(&p).map_err(|e| e.to_string())?;
+  Ok(!s.trim().is_empty())
+}
+
+fn read_midjourney_api_key(app: &tauri::AppHandle) -> Result<String, String> {
+  let p = midjourney_key_path(app)?;
+  if !p.is_file() {
+    return Err("add a WaveSpeed API key first (wavespeed.ai — Midjourney text-to-image)".to_string());
+  }
+  let s = fs::read_to_string(&p).map_err(|e| e.to_string())?;
+  let t = s.trim();
+  if t.is_empty() {
+    return Err("add a WaveSpeed API key first".to_string());
+  }
+  Ok(t.to_string())
+}
+
+fn wavespeed_http_client() -> Result<reqwest::blocking::Client, String> {
+  reqwest::blocking::Client::builder()
+    .connect_timeout(HTTP_CONNECT_TIMEOUT)
+    .timeout(HTTP_LONG_JOB_TIMEOUT)
+    .build()
+    .map_err(|e| e.to_string())
+}
+
+fn is_safe_wavespeed_prediction_id(id: &str) -> bool {
+  let id = id.trim();
+  (8..=128).contains(&id.len())
+    && id
+      .chars()
+      .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+#[tauri::command]
+fn wavespeed_midjourney_submit(app: tauri::AppHandle, body: serde_json::Value) -> Result<String, String> {
+  let key = read_midjourney_api_key(&app)?;
+  let url = format!("{WAVESPEED_API_V3}/midjourney/text-to-image");
+  let client = wavespeed_http_client()?;
+  let res = client
+    .post(&url)
+    .header("Authorization", format!("Bearer {key}"))
+    .header("Content-Type", "application/json")
+    .header("Accept", "application/json")
+    .json(&body)
+    .send()
+    .map_err(|e| e.to_string())?;
+  let status = res.status();
+  let text = res.text().map_err(|e| e.to_string())?;
+  if !status.is_success() {
+    return Err(format!("WaveSpeed HTTP {status}: {text}"));
+  }
+  Ok(text)
+}
+
+#[tauri::command]
+fn wavespeed_midjourney_prediction_result(
+  app: tauri::AppHandle,
+  prediction_id: String,
+) -> Result<String, String> {
+  let id = prediction_id.trim();
+  if !is_safe_wavespeed_prediction_id(id) {
+    return Err("invalid prediction id".to_string());
+  }
+  let key = read_midjourney_api_key(&app)?;
+  let url = format!("{WAVESPEED_API_V3}/predictions/{id}/result");
+  let client = wavespeed_http_client()?;
+  let res = client
+    .get(&url)
+    .header("Authorization", format!("Bearer {key}"))
+    .header("Accept", "application/json")
+    .send()
+    .map_err(|e| e.to_string())?;
+  let status = res.status();
+  let text = res.text().map_err(|e| e.to_string())?;
+  if !status.is_success() {
+    return Err(format!("WaveSpeed HTTP {status}: {text}"));
+  }
+  Ok(text)
+}
+
+fn mj_output_download_host_ok(host: &str) -> bool {
+  let h = host.to_ascii_lowercase();
+  h.ends_with("wavespeed.ai") || h.ends_with("wavespeedcdn.ai")
+}
+
+/// HTTPS GET for a generated image URL (WaveSpeed CDN only — avoids open SSRF).
+#[tauri::command]
+fn fetch_mj_output_bytes(url: String) -> Result<Vec<u8>, String> {
+  let u = url.trim();
+  let parsed = reqwest::Url::parse(u).map_err(|_| "invalid image url".to_string())?;
+  if parsed.scheme() != "https" {
+    return Err("only https image urls".to_string());
+  }
+  let host = parsed.host_str().unwrap_or("");
+  if !mj_output_download_host_ok(host) {
+    return Err("image host is not a WaveSpeed download domain".to_string());
+  }
+  let client = wavespeed_http_client()?;
+  let res = client.get(u).send().map_err(|e| e.to_string())?;
+  let status = res.status();
+  if !status.is_success() {
+    return Err(format!("download HTTP {status}"));
+  }
+  let bytes = res.bytes().map_err(|e| e.to_string())?;
+  if bytes.is_empty() {
+    return Err("empty image".to_string());
+  }
+  if bytes.len() > 32 * 1024 * 1024 {
+    return Err("image too large".to_string());
+  }
+  Ok(bytes.to_vec())
 }
 
 /// Write a PNG (or any bytes) into a game folder next to `main.py` with collision-safe name.
@@ -1330,7 +1518,8 @@ fn build_gemini_request_body(contents: &[GeminiTurn]) -> serde_json::Value {
   serde_json::json!({
     "contents": parts,
     "generationConfig": {
-      "maxOutputTokens": 8192u32,
+      // 8192 was easy to hit on long code / reasoning-heavy replies; models cap as needed.
+      "maxOutputTokens": 32768u32,
       "temperature": 0.9
     }
   })
@@ -1369,7 +1558,10 @@ fn gemini_start_stream(app: tauri::AppHandle, model: String, contents: Vec<Gemin
   );
   std::thread::spawn(move || {
     let client = match reqwest::blocking::Client::builder()
-      .timeout(std::time::Duration::from_secs(300))
+      .connect_timeout(HTTP_CONNECT_TIMEOUT)
+      .tcp_keepalive(HTTP_STREAM_TCP_KEEPALIVE)
+      // No end-to-end timeout: slow models can stream longer than any fixed wall-clock limit.
+      .timeout(None)
       .build()
     {
       Ok(c) => c,
@@ -1466,7 +1658,7 @@ fn gemini_start_stream(app: tauri::AppHandle, model: String, contents: Vec<Gemin
       let piece = gemini_chunk_text(&v);
       if !piece.is_empty() {
         any_chunk = true;
-        let _ = app_thread.emit("gemini-stream-chunk", piece);
+        emit_ai_stream_text(&app_thread, "gemini-stream-chunk", &piece);
       }
     }
     if !any_chunk {
@@ -1484,12 +1676,24 @@ fn openai_chunk_text(v: &serde_json::Value) -> String {
     return out;
   };
   for ch in choices {
-    if let Some(c) = ch
-      .get("delta")
-      .and_then(|d| d.get("content"))
-      .and_then(|c| c.as_str())
-    {
-      out.push_str(c);
+    let Some(delta) = ch.get("delta") else {
+      continue;
+    };
+    let Some(content) = delta.get("content") else {
+      continue;
+    };
+    match content {
+      serde_json::Value::String(s) => out.push_str(s),
+      serde_json::Value::Array(parts) => {
+        for p in parts {
+          if let Some(t) = p.get("text").and_then(|x| x.as_str()) {
+            out.push_str(t);
+          } else if let Some(s) = p.as_str() {
+            out.push_str(s);
+          }
+        }
+      }
+      _ => {}
     }
   }
   out
@@ -1522,12 +1726,17 @@ fn openai_start_stream(app: tauri::AppHandle, model: String, contents: Vec<Gemin
   let m = model.to_ascii_lowercase();
   // GPT-5+ rejects `max_tokens`; it expects `max_completion_tokens` (Chat Completions).
   let use_max_completion_tokens = m.starts_with("gpt-5");
+  let max_out: u32 = if m.starts_with("gpt-5") {
+    65536
+  } else {
+    16384
+  };
   let body = if use_max_completion_tokens {
     serde_json::json!({
       "model": model,
       "messages": messages,
       "stream": true,
-      "max_completion_tokens": 8192u32,
+      "max_completion_tokens": max_out,
       "temperature": 0.9
     })
   } else {
@@ -1535,14 +1744,16 @@ fn openai_start_stream(app: tauri::AppHandle, model: String, contents: Vec<Gemin
       "model": model,
       "messages": messages,
       "stream": true,
-      "max_tokens": 8192u32,
+      "max_tokens": max_out,
       "temperature": 0.9
     })
   };
   let app_thread = app.clone();
   std::thread::spawn(move || {
     let client = match reqwest::blocking::Client::builder()
-      .timeout(std::time::Duration::from_secs(300))
+      .connect_timeout(HTTP_CONNECT_TIMEOUT)
+      .tcp_keepalive(HTTP_STREAM_TCP_KEEPALIVE)
+      .timeout(None)
       .build()
     {
       Ok(c) => c,
@@ -1616,7 +1827,7 @@ fn openai_start_stream(app: tauri::AppHandle, model: String, contents: Vec<Gemin
       let piece = openai_chunk_text(&v);
       if !piece.is_empty() {
         any_chunk = true;
-        let _ = app_thread.emit("openai-stream-chunk", piece);
+        emit_ai_stream_text(&app_thread, "openai-stream-chunk", &piece);
       }
     }
     if !any_chunk {
@@ -1860,6 +2071,11 @@ pub fn run() {
       pixellab_key_configured,
       pixellab_v2_get,
       pixellab_v2_post,
+      save_midjourney_api_key,
+      midjourney_key_configured,
+      wavespeed_midjourney_submit,
+      wavespeed_midjourney_prediction_result,
+      fetch_mj_output_bytes,
       write_project_asset_bytes,
       gemini_start_stream,
       openai_start_stream,

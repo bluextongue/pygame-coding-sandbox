@@ -5,9 +5,15 @@
   "version": "1.1.1",
   "identifier": "com.python.game",
   "build": {
-    "beforeDevCommand": "npm run dev",
+    "beforeDevCommand": {
+      "script": "npm run dev",
+      "cwd": ".."
+    },
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "npm run build",
+    "beforeBuildCommand": {
+      "script": "npm run build",
+      "cwd": ".."
+    },
     "frontendDist": "../frontend/dist"
   },
   "app": {

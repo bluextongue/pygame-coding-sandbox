@@ -1,8 +1,15 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type MouseEvent as ReactMouseEvent,
+} from "react";
 import { convertFileSrc, invoke, isTauri } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 
-type MainTab = "still" | "motion" | "motionPrompt" | "background";
+type MainTab = "still" | "motion" | "motionPrompt" | "background" | "image2pixel";
 
 type Props = {
   open: boolean;
@@ -12,12 +19,75 @@ type Props = {
   projectAssets?: string[];
 };
 
+/** Floating shell — same drag + 8-point resize as the AI panel. */
+type PlRect = { x: number; y: number; w: number; h: number };
+type PlWinEdge = "n" | "s" | "e" | "w" | "ne" | "nw" | "se" | "sw";
+
+const PIXEL_LAB_PNL_MIN_W = 360;
+const PIXEL_LAB_PNL_MIN_H = 240;
+
+function plDefaultWindowRect(): PlRect {
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+  const w = Math.max(PIXEL_LAB_PNL_MIN_W, Math.min(vw * 0.88, 800));
+  const h = Math.max(PIXEL_LAB_PNL_MIN_H, Math.min(vh * 0.8, 700));
+  return { x: (vw - w) / 2, y: (vh - h) / 2, w, h };
+}
+
+function plClampRect(r: PlRect): PlRect {
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+  let { x, y, w, h } = r;
+  w = Math.max(PIXEL_LAB_PNL_MIN_W, w);
+  h = Math.max(PIXEL_LAB_PNL_MIN_H, h);
+  w = Math.min(w, vw);
+  h = Math.min(h, vh);
+  x = Math.max(0, Math.min(x, vw - w));
+  y = Math.max(0, Math.min(y, vh - h));
+  return { x, y, w, h };
+}
+
+function plApplyResize(r: PlRect, edge: PlWinEdge, dx: number, dy: number): PlRect {
+  const { x, y, w, h } = r;
+  switch (edge) {
+    case "e":
+      return { x, y, w: w + dx, h };
+    case "w":
+      return { x: x + dx, y, w: w - dx, h };
+    case "n":
+      return { x, y: y + dy, w, h: h - dy };
+    case "s":
+      return { x, y, w, h: h + dy };
+    case "ne":
+      return { x, y: y + dy, w: w + dx, h: h - dy };
+    case "nw":
+      return { x: x + dx, y: y + dy, w: w - dx, h: h - dy };
+    case "se":
+      return { x, y, w: w + dx, h: h + dy };
+    case "sw":
+      return { x: x + dx, y, w: w - dx, h: h + dy };
+  }
+}
+
+const PL_RESIZE_GRIPS: readonly PlWinEdge[] = ["n", "s", "e", "w", "ne", "nw", "se", "sw"];
+
 function b64ToBytes(dataUrlOrB64: string): Uint8Array {
-  const s = dataUrlOrB64.replace(/^data:image\/\w+;base64,/, "").trim();
+  const s = dataUrlOrB64.replace(/^data:[^;]+;base64,/, "").replace(/\s/g, "");
   const bin = atob(s);
   const out = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
   return out;
+}
+
+/** Standard base64 with correct padding. Pixel Lab `/image-to-pixelart` rejects data URLs / malformed lengths. */
+function bytesToStandardBase64(bytes: Uint8Array): string {
+  let binary = "";
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]!);
+  return btoa(binary);
+}
+
+function pngDataUrlToStrictBase64(dataUrl: string): string {
+  return bytesToStandardBase64(b64ToBytes(dataUrl));
 }
 
 function extractFromEnvelope(json: string): { raw: unknown; data: unknown } {
@@ -183,6 +253,132 @@ async function scaleImageUrlToDataUrlMax256(url: string): Promise<string> {
   return await scaleImageToPngDataUrlMax256(im);
 }
 
+const PIXELART_INPUT_MAX = 1280;
+/** `/remove-background` accepts at most 400×400 (see PixelLab OpenAPI). */
+const REMOVE_BG_MAX = 400;
+
+/** Size after fitting inside `maxSide` (PixelLab image-to-pixelart input limits). */
+function dimensionsAfterMaxSide(iw: number, ih: number, maxSide: number): { w: number; h: number } {
+  if (iw < 1 || ih < 1) return { w: 16, h: 16 };
+  let scale = 1;
+  const m = Math.max(iw, ih);
+  if (m > maxSide) scale = maxSide / m;
+  let w = Math.max(16, Math.round(iw * scale));
+  let h = Math.max(16, Math.round(ih * scale));
+  for (let guard = 0; guard < 16 && Math.max(w, h) > maxSide; guard++) {
+    scale *= 0.995;
+    w = Math.max(16, Math.round(iw * scale));
+    h = Math.max(16, Math.round(ih * scale));
+  }
+  return { w, h };
+}
+
+function suggestPixelartOutputSize(iw: number, ih: number): { ow: number; oh: number } {
+  const { w, h } = dimensionsAfterMaxSide(iw, ih, PIXELART_INPUT_MAX);
+  return {
+    ow: Math.max(16, Math.min(320, Math.round(w / 4))),
+    oh: Math.max(16, Math.min(320, Math.round(h / 4))),
+  };
+}
+
+/** PNG data URL and logical size sent as `image_size` (must match encoded bitmap). */
+async function prepareImageForPixelartInput(
+  im: HTMLImageElement,
+  flattenAlpha: boolean,
+): Promise<{ dataUrl: string; width: number; height: number }> {
+  const iw = im.naturalWidth || im.width;
+  const ih = im.naturalHeight || im.height;
+  const { w: ow, h: oh } = dimensionsAfterMaxSide(iw, ih, PIXELART_INPUT_MAX);
+  const c = document.createElement("canvas");
+  c.width = ow;
+  c.height = oh;
+  const ctx = c.getContext("2d");
+  if (!ctx) throw new Error("Canvas unsupported");
+  ctx.imageSmoothingEnabled = true;
+  if (flattenAlpha) {
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, ow, oh);
+    ctx.drawImage(im, 0, 0, ow, oh);
+  } else {
+    ctx.clearRect(0, 0, ow, oh);
+    ctx.drawImage(im, 0, 0, ow, oh);
+  }
+  const blob = await new Promise<Blob | null>((r) => c.toBlob(r, "image/png"));
+  if (!blob) throw new Error("toBlob failed");
+  const dataUrl = await blobToDataUrl(blob);
+  return { dataUrl, width: ow, height: oh };
+}
+
+/** Raster scaled to fit PixelLab `/remove-background` limits (photo with background intact). */
+async function prepareImageForRemoveBackground(
+  im: HTMLImageElement,
+): Promise<{ dataUrl: string; width: number; height: number }> {
+  const iw = im.naturalWidth || im.width;
+  const ih = im.naturalHeight || im.height;
+  const { w: ow, h: oh } = dimensionsAfterMaxSide(iw, ih, REMOVE_BG_MAX);
+  const c = document.createElement("canvas");
+  c.width = ow;
+  c.height = oh;
+  const ctx = c.getContext("2d");
+  if (!ctx) throw new Error("Canvas unsupported");
+  ctx.imageSmoothingEnabled = true;
+  ctx.clearRect(0, 0, ow, oh);
+  ctx.drawImage(im, 0, 0, ow, oh);
+  const blob = await new Promise<Blob | null>((r) => c.toBlob(r, "image/png"));
+  if (!blob) throw new Error("toBlob failed");
+  const dataUrl = await blobToDataUrl(blob);
+  return { dataUrl, width: ow, height: oh };
+}
+
+/**
+ * PixelLab `/image-to-pixelart` often returns an **opaque** PNG with flat grey where the input was transparent.
+ * Recombine with the cutout from `/remove-background` so those regions get alpha 0 again.
+ */
+async function mergePixelArtWithCutoutAlpha(
+  pixelArtPng: Uint8Array,
+  cutoutIm: HTMLImageElement,
+  outW: number,
+  outH: number,
+): Promise<Uint8Array> {
+  const blob = new Blob([pixelArtPng], { type: "image/png" });
+  const url = URL.createObjectURL(blob);
+  try {
+    const pixIm = await loadImageEl(url);
+    const c = document.createElement("canvas");
+    c.width = outW;
+    c.height = outH;
+    const ctx = c.getContext("2d");
+    if (!ctx) throw new Error("Canvas unsupported");
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(pixIm, 0, 0, outW, outH);
+    const pixData = ctx.getImageData(0, 0, outW, outH);
+
+    const mc = document.createElement("canvas");
+    mc.width = outW;
+    mc.height = outH;
+    const mctx = mc.getContext("2d");
+    if (!mctx) throw new Error("Canvas unsupported");
+    mctx.imageSmoothingEnabled = true;
+    mctx.clearRect(0, 0, outW, outH);
+    mctx.drawImage(cutoutIm, 0, 0, outW, outH);
+    const maskData = mctx.getImageData(0, 0, outW, outH);
+
+    const p = pixData.data;
+    const m = maskData.data;
+    for (let i = 0; i < p.length; i += 4) {
+      const ma = m[i + 3];
+      const pa = p[i + 3];
+      p[i + 3] = Math.min(255, Math.round((pa * ma) / 255));
+    }
+    ctx.putImageData(pixData, 0, 0);
+    const outBlob = await new Promise<Blob | null>((r) => c.toBlob(r, "image/png"));
+    if (!outBlob) throw new Error("toBlob failed");
+    return new Uint8Array(await outBlob.arrayBuffer());
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
 function blobToDataUrl(blob: Blob): Promise<string> {
   return new Promise((resolve, reject) => {
     const r = new FileReader();
@@ -259,6 +455,7 @@ export function PixelLabPanel({ open, onClose, onAssetsChanged, projectAssets = 
   const [motionPromptH, setMotionPromptH] = useState(64);
 
   const motionPngsInProject = projectAssets.filter((n) => /\.png$/i.test(n));
+  const imageAssetsInProject = projectAssets.filter((n) => /\.(png|jpe?g|webp|gif)$/i.test(n));
 
   const [bgDescription, setBgDescription] = useState("parallax-ready pixel sky, clouds, distant hills, soft colors");
   const [bgW, setBgW] = useState(512);
@@ -268,12 +465,26 @@ export function PixelLabPanel({ open, onClose, onAssetsChanged, projectAssets = 
   const [sheetName, setSheetName] = useState("walk_strip.png");
   const [bgFileName, setBgFileName] = useState("background.png");
 
+  const [i2pFile, setI2pFile] = useState<File | null>(null);
+  const [i2pProjectAsset, setI2pProjectAsset] = useState<string | null>(null);
+  const i2pInputRef = useRef<HTMLInputElement>(null);
+  const [i2pSourceLabel, setI2pSourceLabel] = useState<string | null>(null);
+  const [i2pOutW, setI2pOutW] = useState(64);
+  const [i2pOutH, setI2pOutH] = useState(64);
+  const [i2pGuidance, setI2pGuidance] = useState(8);
+  const [i2pTransparent, setI2pTransparent] = useState(true);
+  const [i2pSaveName, setI2pSaveName] = useState("pixelized.png");
+
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [statusLine, setStatusLine] = useState<string | null>(null);
   const [lastPreview, setLastPreview] = useState<string | null>(null);
   const [jsonDebug, setJsonDebug] = useState<string | null>(null);
   const previewUrlRef = useRef<string | null>(null);
+
+  const [frame, setFrame] = useState<PlRect>(() => plDefaultWindowRect());
+  const frameRef = useRef(frame);
+  frameRef.current = frame;
 
   const setPreviewBlob = (bytes: Uint8Array) => {
     if (previewUrlRef.current) {
@@ -295,6 +506,10 @@ export function PixelLabPanel({ open, onClose, onAssetsChanged, projectAssets = 
     [],
   );
 
+  /** Avoid hitting `/balance` on every open; AI panel feels snappier because it rarely re-fetches on open. */
+  const balanceCacheRef = useRef<{ at: number; text: string } | null>(null);
+  const BALANCE_CACHE_MS = 45_000;
+
   const refreshKey = useCallback(async () => {
     if (!isTauri()) return;
     try {
@@ -307,14 +522,24 @@ export function PixelLabPanel({ open, onClose, onAssetsChanged, projectAssets = 
   const refreshBalance = useCallback(async () => {
     if (!isTauri() || !hasKey) {
       setBalance(null);
+      balanceCacheRef.current = null;
+      return;
+    }
+    const c = balanceCacheRef.current;
+    const now = Date.now();
+    if (c && now - c.at < BALANCE_CACHE_MS) {
+      setBalance(c.text);
       return;
     }
     try {
       const t = (await invoke("pixellab_v2_get", { path: "/balance" })) as string;
       const { data } = extractFromEnvelope(t);
-      setBalance(data ? JSON.stringify(data) : t);
+      const text = data ? JSON.stringify(data) : t;
+      setBalance(text);
+      balanceCacheRef.current = { at: Date.now(), text };
     } catch {
       setBalance(null);
+      balanceCacheRef.current = null;
     }
   }, [hasKey]);
 
@@ -325,13 +550,17 @@ export function PixelLabPanel({ open, onClose, onAssetsChanged, projectAssets = 
 
   useEffect(() => {
     if (!open) return;
-    onAssetsChanged?.();
-  }, [open, onAssetsChanged]);
-
-  useEffect(() => {
-    if (!open) return;
     setErr(null);
-    void refreshBalance();
+    let cancelled = false;
+    const id = window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(() => {
+        if (!cancelled) void refreshBalance();
+      });
+    });
+    return () => {
+      cancelled = true;
+      cancelAnimationFrame(id);
+    };
   }, [open, hasKey, refreshBalance]);
 
   const saveKey = async () => {
@@ -340,7 +569,9 @@ export function PixelLabPanel({ open, onClose, onAssetsChanged, projectAssets = 
     try {
       await invoke("save_pixellab_api_key", { key: keyInput });
       setKeyInput("");
+      balanceCacheRef.current = null;
       await refreshKey();
+      await refreshBalance();
     } catch (e) {
       setErr(String(e));
     }
@@ -351,16 +582,26 @@ export function PixelLabPanel({ open, onClose, onAssetsChanged, projectAssets = 
     setErr(null);
     try {
       await invoke("save_pixellab_api_key", { key: "" });
+      balanceCacheRef.current = null;
       await refreshKey();
     } catch (e) {
       setErr(String(e));
     }
   };
 
+  const applyI2pNaturalSizeHints = useCallback(async (im: HTMLImageElement) => {
+    const iw = im.naturalWidth || im.width;
+    const ih = im.naturalHeight || im.height;
+    const { w, h } = dimensionsAfterMaxSide(iw, ih, PIXELART_INPUT_MAX);
+    setI2pSourceLabel(`Source (fit to API input): ${w}×${h}`);
+    const { ow, oh } = suggestPixelartOutputSize(iw, ih);
+    setI2pOutW(ow);
+    setI2pOutH(oh);
+  }, []);
+
   const pollJob = useCallback(async (jobId: string) => {
     const path = `/background-jobs/${jobId}`;
     for (let i = 0; i < 120; i++) {
-      setStatusLine(`Job ${jobId.slice(0, 8)}… (poll ${i + 1}/120, ~5s)`);
       const t = (await invoke("pixellab_v2_get", { path })) as string;
       const { data, raw } = extractFromEnvelope(t);
       const payload = (data ?? raw) as Record<string, unknown> | null;
@@ -630,24 +871,236 @@ export function PixelLabPanel({ open, onClose, onAssetsChanged, projectAssets = 
     }
   };
 
+  const onGenerateImage2Pixelart = async () => {
+    if (!isTauri() || !hasKey) return;
+    if (!i2pFile && !i2pProjectAsset) return;
+    setErr(null);
+    setStatusLine(null);
+    setJsonDebug(null);
+    setBusy(true);
+    setLastPreview(null);
+    try {
+      const targetProject = (await invoke("get_active_game")) as ActiveGameRef;
+      const requested = i2pSaveName.trim() || "pixelized.png";
+      const im = await (async () => {
+        if (i2pProjectAsset) {
+          const p = (await invoke("resolve_asset_path", { name: i2pProjectAsset })) as string;
+          return await loadImageEl(convertFileSrc(p));
+        }
+        const url = URL.createObjectURL(i2pFile!);
+        try {
+          return await loadImageEl(url);
+        } finally {
+          URL.revokeObjectURL(url);
+        }
+      })();
+
+      let dataUrl: string;
+      let inW: number;
+      let inH: number;
+      let removeBgDebug = "";
+      let cutoutForMask: HTMLImageElement | null = null;
+
+      if (i2pTransparent) {
+        setStatusLine("Removing background (PixelLab)…");
+        const rbg = await prepareImageForRemoveBackground(im);
+        const removeBody = {
+          image: {
+            type: "base64" as const,
+            base64: pngDataUrlToStrictBase64(rbg.dataUrl),
+            format: "png" as const,
+          },
+          image_size: { width: rbg.width, height: rbg.height },
+          background_removal_task: "remove_simple_background" as const,
+        };
+        const tR = (await invoke("pixellab_v2_post", { path: "/remove-background", body: removeBody })) as string;
+        removeBgDebug = tR.slice(0, 1200);
+        const emsgR = apiErrorMessage(tR);
+        if (emsgR) {
+          setErr(emsgR);
+          return;
+        }
+        const { data: dataR } = extractFromEnvelope(tR);
+        const rawR = dataR ?? JSON.parse(tR);
+        const b64r = extractFrameBase64s(rawR)[0];
+        if (!b64r) {
+          setErr("No image from remove-background");
+          return;
+        }
+        const imFg = await loadImageEl(b64r.startsWith("data:") ? b64r : `data:image/png;base64,${b64r}`);
+        cutoutForMask = imFg;
+        const prep = await prepareImageForPixelartInput(imFg, false);
+        dataUrl = prep.dataUrl;
+        inW = prep.width;
+        inH = prep.height;
+        setStatusLine(null);
+      } else {
+        const prep = await prepareImageForPixelartInput(im, true);
+        dataUrl = prep.dataUrl;
+        inW = prep.width;
+        inH = prep.height;
+      }
+
+      let ow = Math.max(16, Math.min(320, i2pOutW));
+      let oh = Math.max(16, Math.min(320, i2pOutH));
+      if (ow !== i2pOutW) setI2pOutW(ow);
+      if (oh !== i2pOutH) setI2pOutH(oh);
+      let g = Math.max(1, Math.min(20, i2pGuidance));
+      if (g !== i2pGuidance) setI2pGuidance(g);
+      const body = {
+        image: {
+          type: "base64" as const,
+          base64: pngDataUrlToStrictBase64(dataUrl),
+          format: "png" as const,
+        },
+        image_size: { width: inW, height: inH },
+        output_size: { width: ow, height: oh },
+        text_guidance_scale: g,
+      };
+      const t = (await invoke("pixellab_v2_post", { path: "/image-to-pixelart", body })) as string;
+      setJsonDebug(
+        removeBgDebug
+          ? `remove-background:\n${removeBgDebug}\n\n---\n\nimage-to-pixelart:\n${t.slice(0, 2000)}`
+          : t.slice(0, 2000),
+      );
+      const emsg = apiErrorMessage(t);
+      if (emsg) {
+        setErr(emsg);
+        return;
+      }
+      const { data } = extractFromEnvelope(t);
+      const raw = data ?? JSON.parse(t);
+      const b64 = extractFrameBase64s(raw)[0];
+      if (!b64) {
+        setErr("No image in response");
+        return;
+      }
+      let bytes = b64ToBytes(b64);
+      if (cutoutForMask) {
+        setStatusLine("Applying transparency…");
+        bytes = await mergePixelArtWithCutoutAlpha(bytes, cutoutForMask, ow, oh);
+        setStatusLine(null);
+      }
+      const name = (await invoke("write_project_asset_bytes", {
+        filename: requested,
+        data: Array.from(bytes),
+        project_id: targetProject.id,
+      })) as string;
+      onAssetsChanged?.();
+      setStatusLine(await finalizeSaveStatus(`Saved ${name}`, requested, name, targetProject.id));
+      setPreviewBlob(bytes);
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const onPlTitleBarMouseDown = useCallback((e: ReactMouseEvent<HTMLDivElement>) => {
+    if (e.button !== 0) return;
+    if ((e.target as HTMLElement).closest(".win9x-close-btn, .pixel-lab-head-actions")) return;
+    e.preventDefault();
+    const r0 = { ...frameRef.current };
+    document.body.classList.add("gemini-pnl-noselect");
+    const sx = e.clientX;
+    const sy = e.clientY;
+    const onMove = (ev: MouseEvent) => {
+      setFrame(plClampRect({ ...r0, x: r0.x + (ev.clientX - sx), y: r0.y + (ev.clientY - sy) }));
+    };
+    const onUp = () => {
+      document.body.classList.remove("gemini-pnl-noselect");
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  }, []);
+
+  const onPlResizeGripMouseDown = useCallback((e: ReactMouseEvent<HTMLDivElement>, edge: PlWinEdge) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (e.button !== 0) return;
+    const r0 = { ...frameRef.current };
+    document.body.classList.add("gemini-pnl-noselect");
+    const sx = e.clientX;
+    const sy = e.clientY;
+    const onMove = (ev: MouseEvent) => {
+      const dx = ev.clientX - sx;
+      const dy = ev.clientY - sy;
+      setFrame(plClampRect(plApplyResize(r0, edge, dx, dy)));
+    };
+    const onUp = () => {
+      document.body.classList.remove("gemini-pnl-noselect");
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  }, []);
+
+  useLayoutEffect(() => {
+    if (open) {
+      setFrame((f) => plClampRect(f));
+    }
+  }, [open]);
+
+  useEffect(() => {
+    const onWinResize = () => {
+      setFrame((f) => plClampRect(f));
+    };
+    window.addEventListener("resize", onWinResize);
+    return () => window.removeEventListener("resize", onWinResize);
+  }, []);
+
+  useEffect(
+    () => () => {
+      document.body.classList.remove("gemini-pnl-noselect");
+    },
+    [],
+  );
+
   if (!open) {
     return null;
   }
 
   return (
-    <div className="pixel-lab-outer" role="dialog" aria-label="Pixel Lab" onMouseDown={(e) => e.stopPropagation()}>
-      <div className="win-pop pixel-lab-win">
-        <div className="win-pop-head pixel-lab-head">
-          <span>Pixel Lab</span>
+    <div
+      className="pixel-lab-pnl-outer"
+      role="dialog"
+      aria-label="Pixel Lab"
+      style={{
+        position: "fixed",
+        left: frame.x,
+        top: frame.y,
+        width: frame.w,
+        height: frame.h,
+        zIndex: 1,
+      }}
+    >
+      <div className="win-pop pixel-lab-win" onMouseDown={(e) => e.stopPropagation()}>
+        <div
+          className="win-pop-head pixel-lab-head"
+          onMouseDown={onPlTitleBarMouseDown}
+          title="Drag to move"
+        >
+          <span className="pixel-lab-titletext">Pixel Lab</span>
           <div className="pixel-lab-head-actions">
             <button
               type="button"
               className="win-link-btn"
+              onMouseDown={(e) => e.stopPropagation()}
               onClick={() => void openUrl("https://api.pixellab.ai/v2/llms.txt")}
             >
               API v2
             </button>
-            <button type="button" className="win9x-close-btn" onClick={onClose} title="Close" aria-label="Close">
+            <button
+              type="button"
+              className="win9x-close-btn"
+              onMouseDown={(e) => e.stopPropagation()}
+              onClick={onClose}
+              title="Close"
+              aria-label="Close"
+            >
               <span className="win9x-close-x" aria-hidden>
                 ×
               </span>
@@ -669,7 +1122,7 @@ export function PixelLabPanel({ open, onClose, onAssetsChanged, projectAssets = 
                 </button>{" "}
                 — one sprite at a time, then motion from a still, then wide backgrounds. Uses{" "}
                 <code className="win-pop-code">/create-image-pixflux</code>, <code className="win-pop-code">/animate-with-text-v3</code>,{" "}
-                <code className="win-pop-code">/generate-image-v2</code>.
+                <code className="win-pop-code">/generate-image-v2</code>, <code className="win-pop-code">/image-to-pixelart</code>.
               </p>
               <div className="pixel-lab-keyrow">
                 <input
@@ -700,6 +1153,7 @@ export function PixelLabPanel({ open, onClose, onAssetsChanged, projectAssets = 
                     ["motion", "Motion (from PNG)"],
                     ["motionPrompt", "Motion (prompt)"],
                     ["background", "Background"],
+                    ["image2pixel", "Image → pixel art"],
                   ] as [MainTab, string][]
                 ).map(([k, label]) => (
                   <button
@@ -1041,8 +1495,165 @@ export function PixelLabPanel({ open, onClose, onAssetsChanged, projectAssets = 
                 </>
               )}
 
+              {tab === "image2pixel" && (
+                <>
+                  <p className="pixel-lab-hint" style={{ marginTop: 6 }}>
+                    Raster photo or sketch → game-style pixel art via{" "}
+                    <code className="win-pop-code">/image-to-pixelart</code>. Input is scaled to fit{" "}
+                    <strong>1280</strong> max side; output up to <strong>320×320</strong>.
+                  </p>
+                  {imageAssetsInProject.length > 0 && (
+                    <>
+                      <label className="win-pop-lab" htmlFor="pl-i2p-asset" style={{ marginTop: 4 }}>
+                        Image from project
+                      </label>
+                      <select
+                        id="pl-i2p-asset"
+                        className="win-pop-inp pixel-lab-asset-sel"
+                        value={i2pProjectAsset ?? ""}
+                        onChange={(e) => {
+                          const v = e.target.value || null;
+                          setI2pProjectAsset(v);
+                          if (v) {
+                            setI2pFile(null);
+                            if (i2pInputRef.current) i2pInputRef.current.value = "";
+                            void (async () => {
+                              try {
+                                const p = (await invoke("resolve_asset_path", { name: v })) as string;
+                                const im = await loadImageEl(convertFileSrc(p));
+                                await applyI2pNaturalSizeHints(im);
+                              } catch {
+                                setI2pSourceLabel(null);
+                              }
+                            })();
+                          } else {
+                            setI2pSourceLabel(null);
+                          }
+                        }}
+                        disabled={busy}
+                      >
+                        <option value="">(choose an image in this project…)</option>
+                        {imageAssetsInProject.map((n) => (
+                          <option key={n} value={n}>
+                            {n}
+                          </option>
+                        ))}
+                      </select>
+                    </>
+                  )}
+                  <p className="pixel-lab-sublab" style={{ margin: "6px 0 0" }}>
+                    Or a file on disk
+                  </p>
+                  <input
+                    ref={i2pInputRef}
+                    type="file"
+                    accept="image/png,image/jpeg,image/webp,image/gif"
+                    className="pixel-lab-file"
+                    onChange={(e) => {
+                      const f = e.target.files?.[0] ?? null;
+                      setI2pFile(f);
+                      if (f) {
+                        setI2pProjectAsset(null);
+                        void (async () => {
+                          try {
+                            const url = URL.createObjectURL(f);
+                            const im = await loadImageEl(url);
+                            URL.revokeObjectURL(url);
+                            await applyI2pNaturalSizeHints(im);
+                          } catch {
+                            setI2pSourceLabel(null);
+                          }
+                        })();
+                      } else {
+                        setI2pSourceLabel(null);
+                      }
+                    }}
+                    disabled={busy}
+                  />
+                  {i2pFile && <p className="pixel-lab-filename">{i2pFile.name}</p>}
+                  {i2pProjectAsset && !i2pFile && <p className="pixel-lab-filename">{i2pProjectAsset}</p>}
+                  {i2pSourceLabel && <p className="pixel-lab-sublab">{i2pSourceLabel}</p>}
+                  <div className="pixel-lab-dims" style={{ marginTop: 4 }}>
+                    <span className="win-pop-lab">Output W × H</span>
+                    <div className="pixel-lab-dim-pair">
+                      <input
+                        className="win-pop-inp pixel-lab-num"
+                        type="number"
+                        min={16}
+                        max={320}
+                        value={i2pOutW}
+                        onChange={(e) => setI2pOutW(Math.max(16, Math.min(320, Number(e.target.value) || 64)))}
+                        disabled={busy}
+                      />
+                      <span className="pixel-lab-dim-x" aria-hidden>
+                        ×
+                      </span>
+                      <input
+                        className="win-pop-inp pixel-lab-num"
+                        type="number"
+                        min={16}
+                        max={320}
+                        value={i2pOutH}
+                        onChange={(e) => setI2pOutH(Math.max(16, Math.min(320, Number(e.target.value) || 64)))}
+                        disabled={busy}
+                      />
+                    </div>
+                  </div>
+                  <p className="pixel-lab-sublab" style={{ margin: "2px 0 0" }}>
+                    Tip: ~¼ of the fitted source size (API suggestion).
+                  </p>
+                  <div className="pixel-lab-dims" style={{ marginTop: 4 }}>
+                    <span className="win-pop-lab">Style strength</span>
+                    <div>
+                      <input
+                        className="win-pop-inp pixel-lab-num"
+                        type="number"
+                        min={1}
+                        max={20}
+                        step={0.5}
+                        value={i2pGuidance}
+                        onChange={(e) => setI2pGuidance(Math.max(1, Math.min(20, Number(e.target.value) || 8)))}
+                        disabled={busy}
+                      />
+                      <p className="pixel-lab-sublab" style={{ margin: "2px 0 0" }}>
+                        1–20 (PixelLab <code className="win-pop-code">text_guidance_scale</code>)
+                      </p>
+                    </div>
+                  </div>
+                  <label className="pixel-lab-tgl" style={{ marginTop: 6 }}>
+                    <input
+                      type="checkbox"
+                      checked={i2pTransparent}
+                      onChange={(e) => setI2pTransparent(e.target.checked)}
+                      disabled={busy}
+                    />
+                    <span>Remove background, then pixelate</span>
+                  </label>
+                  <p className="pixel-lab-sublab" style={{ margin: "2px 0 0" }}>
+                    When on: PixelLab <code className="win-pop-code">/remove-background</code> (up to 400×400) then{" "}
+                    <code className="win-pop-code">/image-to-pixelart</code>, like the website — <strong>two</strong> API
+                    steps. When off: flatten onto white and only run image-to-pixel art (one step).
+                  </p>
+                  <label className="win-pop-lab" htmlFor="pl-fn-i2p" style={{ marginTop: 6 }}>
+                    Save as
+                  </label>
+                  <input
+                    id="pl-fn-i2p"
+                    className="win-pop-inp"
+                    value={i2pSaveName}
+                    onChange={(e) => setI2pSaveName(e.target.value)}
+                    disabled={busy}
+                  />
+                </>
+              )}
+
               {err && <p className="pixel-lab-err">{err}</p>}
-              {statusLine && <p className="pixel-lab-status">{statusLine}</p>}
+              {busy && (
+                <p className="pixel-lab-status pixel-lab-status-working" aria-live="polite">
+                  {statusLine || "Working…"}
+                </p>
+              )}
+              {!busy && statusLine && <p className="pixel-lab-status">{statusLine}</p>}
 
               <div className="pixel-lab-go">
                 {tab === "still" && (
@@ -1080,6 +1691,16 @@ export function PixelLabPanel({ open, onClose, onAssetsChanged, projectAssets = 
                     {busy ? "…" : "Generate background"}
                   </button>
                 )}
+                {tab === "image2pixel" && (
+                  <button
+                    type="button"
+                    className="win-btn"
+                    onClick={() => void onGenerateImage2Pixelart()}
+                    disabled={busy || !hasKey || (!i2pFile && !i2pProjectAsset)}
+                  >
+                    {busy ? "…" : "Convert to pixel art"}
+                  </button>
+                )}
               </div>
 
               {lastPreview && (
@@ -1097,6 +1718,16 @@ export function PixelLabPanel({ open, onClose, onAssetsChanged, projectAssets = 
             </>
           )}
         </div>
+      </div>
+      <div className="gemini-pnl-grips" aria-hidden>
+        {PL_RESIZE_GRIPS.map((edge) => (
+          <div
+            key={edge}
+            className={`gemini-pnl-grip gemini-pnl-grip--${edge}`}
+            onMouseDown={(e) => onPlResizeGripMouseDown(e, edge)}
+            title="Resize"
+          />
+        ))}
       </div>
     </div>
   );
