@@ -2,6 +2,7 @@ import "./App.css";
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { convertFileSrc, invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
 import Editor, { type OnChange } from "@monaco-editor/react";
 import { GeminiPanel } from "./GeminiPanel";
@@ -97,7 +98,9 @@ type AssetListItemProps = {
   onCancelRename: () => void;
   onBeginRename: () => void;
   onRemove: () => void;
-  onPlayUrl: (url: string) => void;
+  audioPreview: { name: string; paused: boolean } | null;
+  onPlayAsset: (name: string, url: string) => void;
+  onImagePreview?: (name: string, src: string) => void;
 };
 
 function AssetListItem({
@@ -110,7 +113,9 @@ function AssetListItem({
   onCancelRename,
   onBeginRename,
   onRemove,
-  onPlayUrl,
+  audioPreview,
+  onPlayAsset,
+  onImagePreview,
 }: AssetListItemProps) {
   const [mediaUrl, setMediaUrl] = useState<string | null>(null);
   const [pathLoading, setPathLoading] = useState(false);
@@ -118,6 +123,9 @@ function AssetListItem({
   const assetRenameInputRef = useRef<HTMLInputElement>(null);
   const needPath = isImageFile(name) || isAudioFile(name);
   const showPlay = isAudioFile(name) && mediaUrl;
+  const isThisPlaying = Boolean(
+    showPlay && audioPreview?.name === name && !audioPreview.paused,
+  );
 
   useEffect(() => {
     setThumbFailed(false);
@@ -167,8 +175,14 @@ function AssetListItem({
 
   return (
     <li className="asset-row">
-      <div className="asset-thumb-wrap">
-        {isImageFile(name) && imgSrc && !thumbFailed ? (
+      {isImageFile(name) && imgSrc && !thumbFailed ? (
+        <button
+          type="button"
+          className="asset-thumb-btn"
+          onClick={() => onImagePreview?.(name, imgSrc)}
+          title="View full size"
+          aria-label={`Preview ${name}`}
+        >
           <img
             key={thumbKey}
             className="asset-thumb"
@@ -176,12 +190,14 @@ function AssetListItem({
             alt=""
             onError={() => setThumbFailed(true)}
           />
-        ) : (
+        </button>
+      ) : (
+        <div className="asset-thumb-wrap">
           <span className="asset-thumb-fallback" title={name}>
             {isImageFile(name) && pathLoading ? "…" : isAudioFile(name) ? "♪" : extLabel(name)}
           </span>
-        )}
-      </div>
+        </div>
+      )}
       {isEditing ? (
         <input
           ref={assetRenameInputRef}
@@ -213,11 +229,11 @@ function AssetListItem({
         <button
           type="button"
           className="win-mini-btn asset-play"
-          onClick={() => onPlayUrl(mediaUrl!)}
-          title="Play"
-          aria-label={`Play ${name}`}
+          onClick={() => onPlayAsset(name, mediaUrl!)}
+          title={isThisPlaying ? "Pause" : "Play"}
+          aria-label={isThisPlaying ? `Pause ${name}` : `Play ${name}`}
         >
-          ▶
+          {isThisPlaying ? "⏸" : "▶"}
         </button>
       ) : (
         <span className="asset-play-spacer" aria-hidden />
@@ -254,6 +270,13 @@ export default function App() {
   const [geminiOpen, setGeminiOpen] = useState(false);
   const [pixelLabOpen, setPixelLabOpen] = useState(false);
   const [midjourneyOpen, setMidjourneyOpen] = useState(false);
+  const [pixelLabGenBusy, setPixelLabGenBusy] = useState(false);
+  const [midjourneyGenBusy, setMidjourneyGenBusy] = useState(false);
+  const [aiGenBusy, setAiGenBusy] = useState(false);
+  const [assetImagePreview, setAssetImagePreview] = useState<{
+    name: string;
+    src: string;
+  } | null>(null);
   const projectMenuRef = useRef<HTMLDivElement>(null);
 
   const codeRef = useRef(code);
@@ -261,6 +284,21 @@ export default function App() {
   const saveSeq = useRef(0);
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  const [audioPreview, setAudioPreview] = useState<{
+    name: string;
+    paused: boolean;
+  } | null>(null);
+  const audioPreviewRef = useRef<{
+    name: string;
+    paused: boolean;
+  } | null>(null);
+  const setAudioPreviewState = useCallback(
+    (v: { name: string; paused: boolean } | null) => {
+      audioPreviewRef.current = v;
+      setAudioPreview(v);
+    },
+    [],
+  );
 
   useEffect(() => {
     codeRef.current = code;
@@ -370,6 +408,19 @@ export default function App() {
       }),
       listen<string>("import-asset-err", (e) => {
         appendConsole(`[import] ${e.payload}`);
+      }),
+      /** WebView-local drops — required on Windows (WebView2); window-level DragDrop misses the client area where users drop files. */
+      getCurrentWebview().onDragDropEvent((evt) => {
+        if (evt.payload.type !== "drop") return;
+        for (const path of evt.payload.paths) {
+          void (async () => {
+            try {
+              await invoke("import_asset_path", { fromPath: path });
+            } catch (e) {
+              appendConsole(String(e));
+            }
+          })();
+        }
       }),
     ]).then((unsubs) => {
       if (cancelled) {
@@ -499,24 +550,47 @@ export default function App() {
     [appendConsole, refreshAssets],
   );
 
-  const playAudioUrl = useCallback((url: string) => {
-    if (audioRef.current) {
-      audioRef.current.pause();
-      audioRef.current = null;
+  const playAsset = useCallback((name: string, url: string) => {
+    const el = audioRef.current;
+    const prev = audioPreviewRef.current;
+    if (el && prev?.name === name) {
+      if (!prev.paused) {
+        el.pause();
+        setAudioPreviewState({ name, paused: true });
+      } else {
+        void el
+          .play()
+          .then(() => {
+            setAudioPreviewState({ name, paused: false });
+          })
+          .catch(() => {
+            if (audioRef.current === el) {
+              audioRef.current = null;
+              setAudioPreviewState(null);
+            }
+          });
+      }
+      return;
+    }
+    if (el) {
+      el.pause();
     }
     const a = new Audio(url);
     audioRef.current = a;
-    void a.play().catch(() => {
-      if (audioRef.current === a) {
-        audioRef.current = null;
-      }
-    });
+    setAudioPreviewState({ name, paused: false });
     a.addEventListener("ended", () => {
       if (audioRef.current === a) {
         audioRef.current = null;
+        setAudioPreviewState(null);
       }
     });
-  }, []);
+    void a.play().catch(() => {
+      if (audioRef.current === a) {
+        audioRef.current = null;
+        setAudioPreviewState(null);
+      }
+    });
+  }, [setAudioPreviewState]);
 
   const switchGame = useCallback(
     async (id: string) => {
@@ -614,7 +688,8 @@ export default function App() {
       !exportDone &&
       !geminiOpen &&
       !pixelLabOpen &&
-      !midjourneyOpen
+      !midjourneyOpen &&
+      !assetImagePreview
     )
       return;
     const onKey = (e: KeyboardEvent) => {
@@ -626,11 +701,21 @@ export default function App() {
         setGeminiOpen(false);
         setPixelLabOpen(false);
         setMidjourneyOpen(false);
+        setAssetImagePreview(null);
       }
     };
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
-  }, [floatKind, deleteTarget, projectMenuOpen, exportDone, geminiOpen, pixelLabOpen, midjourneyOpen]);
+  }, [
+    floatKind,
+    deleteTarget,
+    projectMenuOpen,
+    exportDone,
+    geminiOpen,
+    pixelLabOpen,
+    midjourneyOpen,
+    assetImagePreview,
+  ]);
 
   return (
     <div className="app">
@@ -718,35 +803,47 @@ export default function App() {
 
         <button
           type="button"
-          className="gemini-btn"
+          className={`gemini-btn${aiGenBusy ? " gemini-btn--gen-busy" : ""}`}
           onClick={() => setGeminiOpen(true)}
-          title="Open AI: Google Gemini or OpenAI GPT — keys and chat in the app backend"
+          title={
+            aiGenBusy
+              ? "AI — a reply is streaming; click to see it (or wait for it to finish)"
+              : "Open AI: Google Gemini or OpenAI GPT — keys and chat in the app backend"
+          }
           aria-label="Open AI panel"
         >
-          AI
+          AI{aiGenBusy ? " …" : ""}
         </button>
 
         {isTauri() && (
           <button
             type="button"
-            className="gemini-btn"
+            className={`gemini-btn${pixelLabGenBusy ? " gemini-btn--gen-busy" : ""}`}
             onClick={() => setPixelLabOpen(true)}
-            title="Pixel Lab — generate pixel art (token from pixellab.ai)"
+            title={
+              pixelLabGenBusy
+                ? "Pixel Lab — a generation is running (or finishing); click to see progress or result"
+                : "Pixel Lab — API tools (pixellab.ai) and Studio tab to draw sprites"
+            }
             aria-label="Open Pixel Lab"
           >
-            Pixel Lab
+            Pixel Lab{pixelLabGenBusy ? " …" : ""}
           </button>
         )}
 
         {isTauri() && (
           <button
             type="button"
-            className="gemini-btn"
+            className={`gemini-btn${midjourneyGenBusy ? " gemini-btn--gen-busy" : ""}`}
             onClick={() => setMidjourneyOpen(true)}
-            title="Midjourney — text-to-image via WaveSpeed API (wavespeed.ai)"
+            title={
+              midjourneyGenBusy
+                ? "Midjourney — a generation is running (or finishing); click to see progress or result"
+                : "Midjourney — text-to-image via WaveSpeed API (wavespeed.ai)"
+            }
             aria-label="Open Midjourney"
           >
-            Midjourney
+            Midjourney{midjourneyGenBusy ? " …" : ""}
           </button>
         )}
 
@@ -799,7 +896,7 @@ export default function App() {
           }}
         />
       )}
-      {/* Always mount Gemini so stream listeners + live text keep running when the user closes the overlay */}
+      {/* Always mount so stream listeners + live text keep working when the overlay is closed */}
       <div
         className="set-float"
         style={{ zIndex: 120, display: geminiOpen ? "flex" : "none" }}
@@ -811,9 +908,11 @@ export default function App() {
           onSendCodeToEditor={applyGeminiCodeToEditor}
           onRunFromAi={isTauri() ? run : undefined}
           running={running}
+          onGenActivityChange={setAiGenBusy}
         />
       </div>
 
+      {/* Kept mounted so in-flight API/poll work continues in the background when closed */}
       <div
         className="set-float"
         style={{ zIndex: 121, display: pixelLabOpen && isTauri() ? "flex" : "none" }}
@@ -823,6 +922,7 @@ export default function App() {
           open={pixelLabOpen}
           onClose={() => setPixelLabOpen(false)}
           onAssetsChanged={refreshAssets}
+          onGenActivityChange={setPixelLabGenBusy}
           projectAssets={assets}
         />
       </div>
@@ -836,6 +936,7 @@ export default function App() {
           open={midjourneyOpen}
           onClose={() => setMidjourneyOpen(false)}
           onAssetsChanged={refreshAssets}
+          onGenActivityChange={setMidjourneyGenBusy}
         />
       </div>
 
@@ -932,6 +1033,48 @@ export default function App() {
         </div>
       )}
 
+      {isTauri() && assetImagePreview && (
+        <>
+          <div
+            className="set-float-back set-float-back--asset-preview"
+            onMouseDown={() => setAssetImagePreview(null)}
+            aria-hidden
+          />
+          <div
+            className="set-float set-float--asset-preview"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Image preview"
+          >
+            <div className="set-float-in win-pop asset-preview-pop" onMouseDown={(e) => e.stopPropagation()}>
+              <div className="win-pop-head asset-preview-pop-head">
+                <span className="asset-preview-pop-title" title={assetImagePreview.name}>
+                  {assetImagePreview.name}
+                </span>
+                <button
+                  type="button"
+                  className="win9x-close-btn"
+                  onClick={() => setAssetImagePreview(null)}
+                  title="Close"
+                  aria-label="Close preview"
+                >
+                  <span className="win9x-close-x" aria-hidden>
+                    ×
+                  </span>
+                </button>
+              </div>
+              <div className="asset-preview-pop-body">
+                <img
+                  className="asset-preview-pop-img"
+                  src={assetImagePreview.src}
+                  alt={assetImagePreview.name}
+                />
+              </div>
+            </div>
+          </div>
+        </>
+      )}
+
       <div className="main-row" role="main">
         <section className="win-panel" aria-label="Assets">
           <div className="win-panel-header">
@@ -961,7 +1104,9 @@ export default function App() {
                   onCancelRename={() => setEditing(null)}
                   onBeginRename={() => beginRename(name)}
                   onRemove={() => void remove(name)}
-                  onPlayUrl={playAudioUrl}
+                  audioPreview={audioPreview}
+                  onPlayAsset={playAsset}
+                  onImagePreview={isTauri() ? (n, src) => setAssetImagePreview({ name: n, src }) : undefined}
                 />
               ))}
             </ul>

@@ -116,6 +116,10 @@
   cursor: not-allowed;
 }
 
+.gemini-btn--gen-busy {
+  color: #000080;
+}
+
 .set-pop {
   position: absolute;
   top: calc(100% + 2px);
@@ -1104,6 +1108,93 @@ button.ai-pnv-btn.is-on {
   user-select: none;
 }
 
+/* Click image thumbnail to open full-size preview (modal) */
+.asset-thumb-btn {
+  flex: 0 0 40px;
+  width: 40px;
+  height: 40px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #e8e4e0;
+  border: 1px solid #a0a0a0;
+  overflow: hidden;
+  cursor: pointer;
+  line-height: 0;
+  box-sizing: border-box;
+}
+
+.asset-thumb-btn:hover,
+.asset-thumb-btn:focus-visible {
+  border-color: #000080;
+  outline: none;
+}
+
+/* Asset image preview: centered Win9x-style dialog over dim backdrop (z above side panels) */
+.set-float--asset-preview {
+  z-index: 250;
+}
+
+.set-float-back--asset-preview {
+  z-index: 249;
+}
+
+.asset-preview-pop {
+  max-width: min(92vw, 720px);
+  width: 100%;
+  pointer-events: auto;
+}
+
+.asset-preview-pop-head {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 20px;
+  padding: 2px 4px 2px 6px;
+  flex-shrink: 0;
+}
+
+.asset-preview-pop-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.asset-preview-pop-body {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  padding: 10px;
+  min-height: 0;
+  background-color: #c0c0c0;
+  background-image: linear-gradient(45deg, #a8a8a8 25%, transparent 25%),
+    linear-gradient(-45deg, #a8a8a8 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #a8a8a8 75%),
+    linear-gradient(-45deg, transparent 75%, #a8a8a8 75%);
+  background-size: 12px 12px;
+  background-position: 0 0, 0 6px, 6px -6px, -6px 0;
+  border: 2px solid;
+  border-color: #404040 #dfdfdf #dfdfdf #404040;
+  margin: 0 8px 8px 8px;
+  max-height: min(70vh, 600px);
+}
+
+.asset-preview-pop-img {
+  max-width: 100%;
+  max-height: min(65vh, 560px);
+  width: auto;
+  height: auto;
+  object-fit: contain;
+  display: block;
+  box-shadow: 2px 2px 6px rgba(0, 0, 0, 0.25);
+}
+
 .asset-name {
   flex: 1 1 auto;
   min-width: 0;
@@ -1174,6 +1265,18 @@ button.ai-pnv-btn.is-on {
 .win-mini-btn:active {
   border-color: #0a0a0a #ffffff #ffffff #0a0a0a;
   padding: 1px 3px 0 5px;
+}
+
+button.win-mini-btn:disabled,
+button.win-mini-btn:disabled:hover,
+button.win-mini-btn:disabled:active {
+  opacity: 0.5;
+  cursor: not-allowed;
+  color: #606060;
+  background: #b8b4b0;
+  border-color: #a0a0a0 #c8c4c0 #c8c4c0 #a0a0a0;
+  padding: 0 4px;
+  box-shadow: none;
 }
 
 .win-link-btn {
@@ -1271,6 +1374,245 @@ button.ai-pnv-btn.is-on {
   z-index: 1;
 }
 
+/* Pixel art studio — same shell as Pixel Lab */
+.set-float .pixel-studio-pnl-outer {
+  pointer-events: auto;
+  box-sizing: border-box;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+}
+
+.set-float .pixel-studio-pnl-outer .win-pop {
+  max-width: none;
+  width: 100%;
+  flex: 1 1 auto;
+  min-height: 0;
+  height: 100%;
+  max-height: none;
+  overflow: hidden;
+  position: relative;
+  z-index: 1;
+}
+
+.pixel-art-studio-body {
+  min-height: 0;
+  flex: 1 1 auto;
+  overflow: auto;
+  gap: 6px;
+}
+
+.pixel-art-studio-lead {
+  font-size: 10px;
+  line-height: 1.45;
+  color: #333;
+  margin: 0;
+}
+
+.pixel-art-studio-toolbar {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+}
+
+.pixel-art-studio-group {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 6px;
+}
+
+.pixel-art-studio-color {
+  width: 32px;
+  height: 22px;
+  padding: 0;
+  border: 1px solid;
+  border-color: #0a0a0a #dfdfdf #dfdfdf #0a0a0a;
+  background: #fff;
+  cursor: pointer;
+}
+
+input.pixel-art-studio-zoom {
+  width: 88px;
+  min-height: 0;
+  vertical-align: middle;
+}
+
+.pixel-art-studio-wxh {
+  font: 10px/1.2 ui-monospace, "Cascadia Code", "SF Mono", Consolas, monospace;
+  color: #404040;
+  user-select: none;
+}
+
+label.pixel-art-tgl {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10px;
+  color: #000;
+  cursor: pointer;
+  user-select: none;
+  margin: 0;
+}
+
+.pixel-art-canvas-outer {
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  min-height: 0;
+  flex: 1 1 140px;
+  padding: 6px 2px 4px 2px;
+  overflow: auto;
+  background: repeating-conic-gradient(#a8a4a0 0% 25%, #8c8884 0% 50%) 0 0/16px 16px;
+  border: 1px solid;
+  border-color: #0a0a0a #dfdfdf #dfdfdf #0a0a0a;
+  box-shadow: inset 1px 1px 0 #6a6a6a;
+}
+
+.pixel-art-canvas-surface {
+  flex: 0 0 auto;
+  image-rendering: pixelated;
+  image-rendering: crisp-edges;
+  box-shadow: 2px 2px 0 rgba(0, 0, 0, 0.2);
+  background: rgba(255, 255, 255, 0.15);
+}
+
+.pixel-art-canvas {
+  display: block;
+  vertical-align: top;
+  background: transparent;
+}
+
+.pixel-art-studio-foot {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 2px;
+  padding-top: 4px;
+  border-top: 1px solid #a0a0a0;
+}
+
+.pixel-art-studio-open,
+.pixel-art-studio-save {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 8px;
+}
+
+/* Sprite sheet: frame strip + export */
+.pixel-art-sheetbar {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 2px;
+  padding: 6px 0 2px 0;
+  border-top: 1px solid #a0a0a0;
+  border-bottom: 1px solid #a0a0a0;
+  flex-shrink: 0;
+}
+
+.pixel-art-sheetbar-row1 {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 8px;
+  min-width: 0;
+}
+
+span.pixel-art-sheet-cels-label {
+  flex: 0 0 auto;
+  margin: 0;
+  font-size: 10px;
+  line-height: 1.2;
+  color: #000;
+  font-weight: 700;
+  align-self: center;
+}
+
+.pixel-art-celstrip {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: wrap;
+  gap: 2px 4px;
+  align-items: center;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+button.pixel-art-cel-pill {
+  min-width: 1.75rem;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
+.pixel-art-sheetbar-actions {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+}
+
+.pixel-art-cel-mov {
+  display: inline-flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 2px 4px;
+  margin-left: 2px;
+}
+
+.pixel-art-cel-mov-lbl {
+  font: 10px/1.2 ui-monospace, "Cascadia Code", "SF Mono", Consolas, monospace;
+  font-weight: 700;
+  color: #000080;
+  min-width: 1.5rem;
+  text-align: center;
+  user-select: none;
+  padding: 0 2px;
+}
+
+/* Reorder cels in the export strip (separate from ◀/▶ frame step) */
+.pixel-art-strip-order {
+  display: inline-flex;
+  flex-direction: row;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px 4px;
+  margin-left: 4px;
+  padding-left: 6px;
+  border-left: 1px solid #a0a0a0;
+}
+
+span.pixel-art-strip-order-lab {
+  font-size: 9px;
+  color: #404040;
+  user-select: none;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+  margin: 0;
+}
+
+p.pixel-art-sheetbar-hint {
+  margin: 2px 0 0 0;
+  font-size: 9px;
+  line-height: 1.4;
+  color: #404040;
+}
+
+.pixel-art-sheet-export {
+  margin-top: 4px;
+  padding-top: 4px;
+  border-top: 0;
+}
+
 .pixel-lab-win {
   min-height: 0;
   display: flex;
@@ -1348,7 +1690,11 @@ button.ai-pnv-btn.is-on {
   margin-top: 6px;
 }
 
-/* Main tabs: Still | Motion | Background */
+/* Main tabs: Still | Motion | … | Studio (draw) */
+.pixel-lab-studio-mount {
+  margin-top: 4px;
+}
+
 .pixel-lab-tabs {
   display: flex;
   flex-direction: row;
@@ -1730,6 +2076,19 @@ label.midjourney-tgl input {
   max-width: 100%;
   max-height: 220px;
   object-fit: contain;
+}
+
+.midjourney-preview--grid {
+  flex-wrap: wrap;
+  gap: 6px;
+  justify-content: flex-start;
+  align-content: flex-start;
+}
+
+.midjourney-preview--grid .midjourney-preview-img {
+  max-width: calc(50% - 3px);
+  max-height: 150px;
+  flex: 0 0 auto;
 }
 
 .midjourney-json {

@@ -910,29 +910,6 @@ fn stop_sandbox(
   stop_child(&*state)
 }
 
-fn import_path_drop(app: &tauri::AppHandle, path: &Path) {
-  if !path.is_file() {
-    return;
-  }
-  let s = path.to_string_lossy().to_string();
-  let ws = match active_sandbox_dir(app) {
-    Ok(w) => w,
-    Err(e) => {
-      let _ = app.emit("import-asset-err", e);
-      return;
-    }
-  };
-  match copy_import(&s, &ws) {
-    Ok(name) => {
-      let _ = app.emit("import-asset-ok", name);
-    }
-    Err(e) => {
-      let _ = app.emit("import-asset-err", e);
-    }
-  }
-  let _ = app.emit("assets-updated", serde_json::Value::Null);
-}
-
 // ---- Google Gemini (Generative Language API) — key on disk, requests from Rust ----
 
 fn gemini_key_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
@@ -1103,8 +1080,10 @@ fn read_pixellab_api_key(app: &tauri::AppHandle) -> Result<String, String> {
   Ok(t.to_string())
 }
 
-fn pixellab_http_client() -> Result<reqwest::blocking::Client, String> {
-  reqwest::blocking::Client::builder()
+/// Long-running PixelLab / WaveSpeed API calls: **async** client so the window stays responsive (no macOS
+/// wait cursor from blocking the main thread on synchronous `tauri::command` HTTP).
+fn long_job_http_client_async() -> Result<reqwest::Client, String> {
+  reqwest::Client::builder()
     .connect_timeout(HTTP_CONNECT_TIMEOUT)
     .timeout(HTTP_LONG_JOB_TIMEOUT)
     .build()
@@ -1176,7 +1155,7 @@ fn pixellab_post_path_ok(path: &str) -> bool {
 
 /// GET `https://api.pixellab.ai/v2` + path (path may include `?…` for `/characters?limit=…`).
 #[tauri::command]
-fn pixellab_v2_get(app: tauri::AppHandle, path: String) -> Result<String, String> {
+async fn pixellab_v2_get(app: tauri::AppHandle, path: String) -> Result<String, String> {
   if !path.starts_with('/') || path.contains("..") {
     return Err("invalid path".to_string());
   }
@@ -1185,15 +1164,16 @@ fn pixellab_v2_get(app: tauri::AppHandle, path: String) -> Result<String, String
   }
   let key = read_pixellab_api_key(&app)?;
   let url = format!("{PIXELLAB_V2}{path}");
-  let client = pixellab_http_client()?;
+  let client = long_job_http_client_async()?;
   let res = client
     .get(&url)
     .header("Authorization", format!("Bearer {key}"))
     .header("Accept", "application/json")
     .send()
+    .await
     .map_err(|e| e.to_string())?;
   let status = res.status();
-  let text = res.text().map_err(|e| e.to_string())?;
+  let text = res.text().await.map_err(|e| e.to_string())?;
   if !status.is_success() {
     return Err(format!("PixelLab HTTP {status}: {text}"));
   }
@@ -1202,7 +1182,7 @@ fn pixellab_v2_get(app: tauri::AppHandle, path: String) -> Result<String, String
 
 /// POST JSON to an allowlisted PixelLab v2 path; returns response body (JSON text).
 #[tauri::command]
-fn pixellab_v2_post(app: tauri::AppHandle, path: String, body: serde_json::Value) -> Result<String, String> {
+async fn pixellab_v2_post(app: tauri::AppHandle, path: String, body: serde_json::Value) -> Result<String, String> {
   if !path.starts_with('/') || path.contains("..") {
     return Err("invalid path".to_string());
   }
@@ -1211,16 +1191,17 @@ fn pixellab_v2_post(app: tauri::AppHandle, path: String, body: serde_json::Value
   }
   let key = read_pixellab_api_key(&app)?;
   let url = format!("{PIXELLAB_V2}{path}");
-  let client = pixellab_http_client()?;
+  let client = long_job_http_client_async()?;
   let res = client
     .post(&url)
     .header("Authorization", format!("Bearer {key}"))
     .header("Content-Type", "application/json")
     .json(&body)
     .send()
+    .await
     .map_err(|e| e.to_string())?;
   let status = res.status();
-  let text = res.text().map_err(|e| e.to_string())?;
+  let text = res.text().await.map_err(|e| e.to_string())?;
   if !status.is_success() {
     return Err(format!("PixelLab HTTP {status}: {text}"));
   }
@@ -1286,14 +1267,6 @@ fn read_midjourney_api_key(app: &tauri::AppHandle) -> Result<String, String> {
   Ok(t.to_string())
 }
 
-fn wavespeed_http_client() -> Result<reqwest::blocking::Client, String> {
-  reqwest::blocking::Client::builder()
-    .connect_timeout(HTTP_CONNECT_TIMEOUT)
-    .timeout(HTTP_LONG_JOB_TIMEOUT)
-    .build()
-    .map_err(|e| e.to_string())
-}
-
 fn is_safe_wavespeed_prediction_id(id: &str) -> bool {
   let id = id.trim();
   (8..=128).contains(&id.len())
@@ -1303,10 +1276,10 @@ fn is_safe_wavespeed_prediction_id(id: &str) -> bool {
 }
 
 #[tauri::command]
-fn wavespeed_midjourney_submit(app: tauri::AppHandle, body: serde_json::Value) -> Result<String, String> {
+async fn wavespeed_midjourney_submit(app: tauri::AppHandle, body: serde_json::Value) -> Result<String, String> {
   let key = read_midjourney_api_key(&app)?;
   let url = format!("{WAVESPEED_API_V3}/midjourney/text-to-image");
-  let client = wavespeed_http_client()?;
+  let client = long_job_http_client_async()?;
   let res = client
     .post(&url)
     .header("Authorization", format!("Bearer {key}"))
@@ -1314,9 +1287,10 @@ fn wavespeed_midjourney_submit(app: tauri::AppHandle, body: serde_json::Value) -
     .header("Accept", "application/json")
     .json(&body)
     .send()
+    .await
     .map_err(|e| e.to_string())?;
   let status = res.status();
-  let text = res.text().map_err(|e| e.to_string())?;
+  let text = res.text().await.map_err(|e| e.to_string())?;
   if !status.is_success() {
     return Err(format!("WaveSpeed HTTP {status}: {text}"));
   }
@@ -1324,7 +1298,7 @@ fn wavespeed_midjourney_submit(app: tauri::AppHandle, body: serde_json::Value) -
 }
 
 #[tauri::command]
-fn wavespeed_midjourney_prediction_result(
+async fn wavespeed_midjourney_prediction_result(
   app: tauri::AppHandle,
   prediction_id: String,
 ) -> Result<String, String> {
@@ -1334,15 +1308,16 @@ fn wavespeed_midjourney_prediction_result(
   }
   let key = read_midjourney_api_key(&app)?;
   let url = format!("{WAVESPEED_API_V3}/predictions/{id}/result");
-  let client = wavespeed_http_client()?;
+  let client = long_job_http_client_async()?;
   let res = client
     .get(&url)
     .header("Authorization", format!("Bearer {key}"))
     .header("Accept", "application/json")
     .send()
+    .await
     .map_err(|e| e.to_string())?;
   let status = res.status();
-  let text = res.text().map_err(|e| e.to_string())?;
+  let text = res.text().await.map_err(|e| e.to_string())?;
   if !status.is_success() {
     return Err(format!("WaveSpeed HTTP {status}: {text}"));
   }
@@ -1356,7 +1331,7 @@ fn mj_output_download_host_ok(host: &str) -> bool {
 
 /// HTTPS GET for a generated image URL (WaveSpeed CDN only — avoids open SSRF).
 #[tauri::command]
-fn fetch_mj_output_bytes(url: String) -> Result<Vec<u8>, String> {
+async fn fetch_mj_output_bytes(url: String) -> Result<Vec<u8>, String> {
   let u = url.trim();
   let parsed = reqwest::Url::parse(u).map_err(|_| "invalid image url".to_string())?;
   if parsed.scheme() != "https" {
@@ -1366,13 +1341,13 @@ fn fetch_mj_output_bytes(url: String) -> Result<Vec<u8>, String> {
   if !mj_output_download_host_ok(host) {
     return Err("image host is not a WaveSpeed download domain".to_string());
   }
-  let client = wavespeed_http_client()?;
-  let res = client.get(u).send().map_err(|e| e.to_string())?;
+  let client = long_job_http_client_async()?;
+  let res = client.get(u).send().await.map_err(|e| e.to_string())?;
   let status = res.status();
   if !status.is_success() {
     return Err(format!("download HTTP {status}"));
   }
-  let bytes = res.bytes().map_err(|e| e.to_string())?;
+  let bytes = res.bytes().await.map_err(|e| e.to_string())?;
   if bytes.is_empty() {
     return Err("empty image".to_string());
   }
@@ -1410,6 +1385,35 @@ fn write_project_asset_bytes(
   fs::write(&p, data).map_err(|e| e.to_string())?;
   let _ = app.emit("assets-updated", serde_json::Value::Null);
   Ok(final_name)
+}
+
+/// Overwrite an existing asset file in the project folder (or create if missing), same path rules as
+/// `write_project_asset_bytes` but without the unique-name disambiguation — used by Pixel Art Studio “save”.
+#[tauri::command]
+fn overwrite_project_asset(
+  app: tauri::AppHandle,
+  filename: String,
+  data: Vec<u8>,
+  project_id: Option<String>,
+) -> Result<(), String> {
+  if data.is_empty() {
+    return Err("empty data".to_string());
+  }
+  let name = filename.trim();
+  if name.is_empty() || name.contains("..") || name.contains('/') || name.contains('\\') {
+    return Err("invalid file name".to_string());
+  }
+  if is_reserved_data_filename(name) {
+    return Err("that name is reserved for project code (main.py)".to_string());
+  }
+  let root = match project_id.as_deref() {
+    None | Some("") => active_sandbox_dir(&app)?,
+    Some(id) => game_sandbox_dir_by_id(&app, id)?,
+  };
+  let p = root.join(name);
+  fs::write(&p, data).map_err(|e| e.to_string())?;
+  let _ = app.emit("assets-updated", serde_json::Value::Null);
+  Ok(())
 }
 
 #[derive(serde::Deserialize, serde::Serialize, Clone, Debug, PartialEq, Eq)]
@@ -2036,16 +2040,6 @@ pub fn run() {
     .manage(Arc::new(RunnerState {
       child: Mutex::new(None),
     }))
-    .on_window_event(|window, event: &tauri::WindowEvent| {
-      if let tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, position: _ }) =
-        event.to_owned()
-      {
-        let app = window.app_handle().clone();
-        for p in paths {
-          import_path_drop(&app, p.as_path());
-        }
-      }
-    })
     .invoke_handler(tauri::generate_handler![
       list_games,
       get_active_game,
@@ -2077,6 +2071,7 @@ pub fn run() {
       wavespeed_midjourney_prediction_result,
       fetch_mj_output_bytes,
       write_project_asset_bytes,
+      overwrite_project_asset,
       gemini_start_stream,
       openai_start_stream,
       list_gemini_chats,

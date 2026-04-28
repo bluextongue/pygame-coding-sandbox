@@ -13,6 +13,8 @@ type Props = {
   open: boolean;
   onClose: () => void;
   onAssetsChanged?: () => void;
+  /** Fires when a Midjourney generation starts or fully finishes (while the panel is closed, too). */
+  onGenActivityChange?: (busy: boolean) => void;
 };
 
 type MjRect = { x: number; y: number; w: number; h: number };
@@ -137,7 +139,7 @@ const ASPECT_RATIOS = ["1:1", "16:9", "9:16", "4:3", "3:4", "2:3", "3:2", "9:21"
 const MJ_VERSIONS = ["6", "6.1", "7"] as const;
 const MJ_QUALITY = [0.25, 0.5, 1, 2] as const;
 
-export function MidjourneyPanel({ open, onClose, onAssetsChanged }: Props) {
+export function MidjourneyPanel({ open, onClose, onAssetsChanged, onGenActivityChange }: Props) {
   const [keyInput, setKeyInput] = useState("");
   const [hasKey, setHasKey] = useState(false);
   const [prompt, setPrompt] = useState("cinematic portrait of a robot explorer, golden hour, detailed");
@@ -155,29 +157,34 @@ export function MidjourneyPanel({ open, onClose, onAssetsChanged }: Props) {
   const [busy, setBusy] = useState(false);
   const [statusLine, setStatusLine] = useState<string | null>(null);
   const [jsonDebug, setJsonDebug] = useState<string | null>(null);
-  const [lastPreview, setLastPreview] = useState<string | null>(null);
-  const previewUrlRef = useRef<string | null>(null);
+  const [previewUrls, setPreviewUrls] = useState<string[]>([]);
+  const previewUrlsRef = useRef<string[]>([]);
 
   const [frame, setFrame] = useState<MjRect>(() => mjDefaultWindowRect());
   const frameRef = useRef(frame);
   frameRef.current = frame;
 
-  const setPreviewBlob = (bytes: Uint8Array) => {
-    if (previewUrlRef.current) {
-      URL.revokeObjectURL(previewUrlRef.current);
-      previewUrlRef.current = null;
+  const clearPreviewObjectUrls = () => {
+    for (const u of previewUrlsRef.current) {
+      URL.revokeObjectURL(u);
     }
-    const u = URL.createObjectURL(new Blob([bytes], { type: "image/png" }));
-    previewUrlRef.current = u;
-    setLastPreview(u);
+    previewUrlsRef.current = [];
+  };
+
+  const setPreviewBlobs = (allBytes: Uint8Array[]) => {
+    clearPreviewObjectUrls();
+    const next: string[] = [];
+    for (const bytes of allBytes) {
+      const u = URL.createObjectURL(new Blob([bytes], { type: "image/png" }));
+      next.push(u);
+    }
+    previewUrlsRef.current = next;
+    setPreviewUrls(next);
   };
 
   useEffect(
     () => () => {
-      if (previewUrlRef.current) {
-        URL.revokeObjectURL(previewUrlRef.current);
-        previewUrlRef.current = null;
-      }
+      clearPreviewObjectUrls();
     },
     [],
   );
@@ -197,9 +204,8 @@ export function MidjourneyPanel({ open, onClose, onAssetsChanged }: Props) {
   }, [open, refreshKey]);
 
   useEffect(() => {
-    if (!open) return;
-    setErr(null);
-  }, [open]);
+    onGenActivityChange?.(busy);
+  }, [busy, onGenActivityChange]);
 
   const saveKey = async () => {
     if (!isTauri()) return;
@@ -253,7 +259,8 @@ export function MidjourneyPanel({ open, onClose, onAssetsChanged }: Props) {
     setStatusLine(null);
     setJsonDebug(null);
     setBusy(true);
-    setLastPreview(null);
+    clearPreviewObjectUrls();
+    setPreviewUrls([]);
     try {
       const targetProject = (await invoke("get_active_game")) as ActiveGameRef;
       const requested = saveName.trim() || "midjourney.png";
@@ -287,8 +294,10 @@ export function MidjourneyPanel({ open, onClose, onAssetsChanged }: Props) {
         const stem = requested.replace(/\.(png|jpe?g|webp)$/i, "") || "midjourney";
         const extMatch = requested.match(/(\.[a-z]+)$/i);
         const ext = extMatch ? extMatch[1].toLowerCase() : ".png";
+        const forPreview: Uint8Array[] = [];
         for (let idx = 0; idx < outs.length; idx++) {
           const bytes = await outputRefToBytes(outs[idx]!);
+          forPreview.push(bytes);
           const fn = `${stem}_${idx + 1}${ext}`;
           await invoke("write_project_asset_bytes", {
             filename: fn,
@@ -305,7 +314,7 @@ export function MidjourneyPanel({ open, onClose, onAssetsChanged }: Props) {
             targetProject.id,
           ),
         );
-        setPreviewBlob(await outputRefToBytes(outs[0]!));
+        setPreviewBlobs(forPreview);
       } else {
         const bytes = await outputRefToBytes(outs[0]!);
         const name = (await invoke("write_project_asset_bytes", {
@@ -319,7 +328,7 @@ export function MidjourneyPanel({ open, onClose, onAssetsChanged }: Props) {
           msg += ` — ${outs.length} variants; enable “Save all grid” to save each file.`;
         }
         setStatusLine(msg);
-        setPreviewBlob(bytes);
+        setPreviewBlobs([bytes]);
       }
     } catch (e) {
       setErr(String(e));
@@ -391,15 +400,13 @@ export function MidjourneyPanel({ open, onClose, onAssetsChanged }: Props) {
     [],
   );
 
-  if (!open) {
-    return null;
-  }
-
   return (
     <div
       className="midjourney-pnl-outer"
       role="dialog"
       aria-label="Midjourney"
+      aria-hidden={!open}
+      inert={!open ? true : undefined}
       style={{
         position: "fixed",
         left: frame.x,
@@ -634,9 +641,20 @@ export function MidjourneyPanel({ open, onClose, onAssetsChanged }: Props) {
                   {busy ? "…" : "Generate"}
                 </button>
               </div>
-              {lastPreview && (
-                <div className="midjourney-preview">
-                  <img src={lastPreview} alt="Preview" className="midjourney-preview-img" />
+              {previewUrls.length > 0 && (
+                <div
+                  className={`midjourney-preview${
+                    previewUrls.length > 1 ? " midjourney-preview--grid" : ""
+                  }`}
+                >
+                  {previewUrls.map((u, i) => (
+                    <img
+                      key={u}
+                      src={u}
+                      alt={`Result ${i + 1} of ${previewUrls.length}`}
+                      className="midjourney-preview-img"
+                    />
+                  ))}
                 </div>
               )}
               {jsonDebug && (

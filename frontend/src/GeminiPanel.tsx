@@ -374,9 +374,18 @@ type Props = {
   onRunFromAi?: () => void | Promise<void>;
   /** Disables the Run control while a run is in progress. */
   running?: boolean;
+  /** True while a reply is streaming (toolbar can show activity when the panel is closed). */
+  onGenActivityChange?: (busy: boolean) => void;
 };
 
-export function GeminiPanel({ open, onClose, onSendCodeToEditor, onRunFromAi, running = false }: Props) {
+export function GeminiPanel({
+  open,
+  onClose,
+  onSendCodeToEditor,
+  onRunFromAi,
+  running = false,
+  onGenActivityChange,
+}: Props) {
   const [provider, setProvider] = useState<AiProvider>("gemini");
   const [model, setModel] = useState(GEMINI_MODELS[0].id);
   const [keyInput, setKeyInput] = useState("");
@@ -447,6 +456,10 @@ export function GeminiPanel({ open, onClose, onSendCodeToEditor, onRunFromAi, ru
   useEffect(() => {
     setSentToEditorKeys({});
   }, [activeChatId]);
+
+  useEffect(() => {
+    onGenActivityChange?.(sending);
+  }, [sending, onGenActivityChange]);
 
   // Load or create a saved session — first time the panel is opened (avoids work until needed).
   useEffect(() => {

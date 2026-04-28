@@ -8,13 +8,16 @@ import {
 } from "react";
 import { convertFileSrc, invoke, isTauri } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { PixelArtStudioContent } from "./PixelArtStudioPanel";
 
-type MainTab = "still" | "motion" | "motionPrompt" | "background" | "image2pixel";
+type MainTab = "still" | "motion" | "motionPrompt" | "background" | "image2pixel" | "studio";
 
 type Props = {
   open: boolean;
   onClose: () => void;
   onAssetsChanged?: () => void;
+  /** Fires when a Pixel Lab generation run starts or fully finishes (while the panel is closed, too). */
+  onGenActivityChange?: (busy: boolean) => void;
   /** Filenames in the project (same as Assets panel); Motion tab lists `.png` here. */
   projectAssets?: string[];
 };
@@ -432,7 +435,13 @@ async function stitchFramesHorizontalPng(b64OrDataUrls: string[]): Promise<Uint8
   return new Uint8Array(await blob.arrayBuffer());
 }
 
-export function PixelLabPanel({ open, onClose, onAssetsChanged, projectAssets = [] }: Props) {
+export function PixelLabPanel({
+  open,
+  onClose,
+  onAssetsChanged,
+  onGenActivityChange,
+  projectAssets = [],
+}: Props) {
   const [tab, setTab] = useState<MainTab>("still");
 
   const [keyInput, setKeyInput] = useState("");
@@ -550,7 +559,6 @@ export function PixelLabPanel({ open, onClose, onAssetsChanged, projectAssets = 
 
   useEffect(() => {
     if (!open) return;
-    setErr(null);
     let cancelled = false;
     const id = window.requestAnimationFrame(() => {
       window.requestAnimationFrame(() => {
@@ -562,6 +570,10 @@ export function PixelLabPanel({ open, onClose, onAssetsChanged, projectAssets = 
       cancelAnimationFrame(id);
     };
   }, [open, hasKey, refreshBalance]);
+
+  useEffect(() => {
+    onGenActivityChange?.(busy);
+  }, [busy, onGenActivityChange]);
 
   const saveKey = async () => {
     if (!isTauri()) return;
@@ -1059,15 +1071,13 @@ export function PixelLabPanel({ open, onClose, onAssetsChanged, projectAssets = 
     [],
   );
 
-  if (!open) {
-    return null;
-  }
-
   return (
     <div
       className="pixel-lab-pnl-outer"
       role="dialog"
       aria-label="Pixel Lab"
+      aria-hidden={!open}
+      inert={!open ? true : undefined}
       style={{
         position: "fixed",
         left: frame.x,
@@ -1116,35 +1126,45 @@ export function PixelLabPanel({ open, onClose, onAssetsChanged, projectAssets = 
 
           {isTauri() && (
             <>
-              <p className="win-pop-txt" style={{ marginTop: 0 }}>
-                <button type="button" className="win-link-btn" onClick={() => void openUrl("https://pixellab.ai/account")}>
-                  Get a token
-                </button>{" "}
-                — one sprite at a time, then motion from a still, then wide backgrounds. Uses{" "}
-                <code className="win-pop-code">/create-image-pixflux</code>, <code className="win-pop-code">/animate-with-text-v3</code>,{" "}
-                <code className="win-pop-code">/generate-image-v2</code>, <code className="win-pop-code">/image-to-pixelart</code>.
-              </p>
-              <div className="pixel-lab-keyrow">
-                <input
-                  className="win-pop-inp"
-                  type="password"
-                  placeholder={
-                    hasKey ? "•••• key on file — paste to replace" : "API token"
-                  }
-                  value={keyInput}
-                  onChange={(e) => setKeyInput(e.target.value)}
-                  autoComplete="off"
-                />
-                <button type="button" className="win-btn" onClick={() => void saveKey()} disabled={!keyInput.trim()}>
-                  Save
-                </button>
-                {hasKey && (
-                  <button type="button" className="win-btn" onClick={() => void clearKey()}>
-                    Remove
-                  </button>
-                )}
-              </div>
-              {balance && <p className="pixel-lab-balance">Balance: {balance}</p>}
+              {tab !== "studio" && (
+                <>
+                  <p className="win-pop-txt" style={{ marginTop: 0 }}>
+                    <button type="button" className="win-link-btn" onClick={() => void openUrl("https://pixellab.ai/account")}>
+                      Get a token
+                    </button>{" "}
+                    — one sprite at a time, then motion from a still, then wide backgrounds. Uses{" "}
+                    <code className="win-pop-code">/create-image-pixflux</code>, <code className="win-pop-code">/animate-with-text-v3</code>,{" "}
+                    <code className="win-pop-code">/generate-image-v2</code>, <code className="win-pop-code">/image-to-pixelart</code>.
+                  </p>
+                  <div className="pixel-lab-keyrow">
+                    <input
+                      className="win-pop-inp"
+                      type="password"
+                      placeholder={
+                        hasKey ? "•••• key on file — paste to replace" : "API token"
+                      }
+                      value={keyInput}
+                      onChange={(e) => setKeyInput(e.target.value)}
+                      autoComplete="off"
+                    />
+                    <button type="button" className="win-btn" onClick={() => void saveKey()} disabled={!keyInput.trim()}>
+                      Save
+                    </button>
+                    {hasKey && (
+                      <button type="button" className="win-btn" onClick={() => void clearKey()}>
+                        Remove
+                      </button>
+                    )}
+                  </div>
+                  {balance && <p className="pixel-lab-balance">Balance: {balance}</p>}
+                </>
+              )}
+
+              {tab === "studio" && (
+                <p className="win-pop-txt" style={{ marginTop: 0 }}>
+                  <strong>Studio</strong> — draw cels and export a spritesheet to the same project folder. No PixelLab API key needed.
+                </p>
+              )}
 
               <div className="pixel-lab-tabs" role="tablist" aria-label="Mode">
                 {(
@@ -1154,6 +1174,7 @@ export function PixelLabPanel({ open, onClose, onAssetsChanged, projectAssets = 
                     ["motionPrompt", "Motion (prompt)"],
                     ["background", "Background"],
                     ["image2pixel", "Image → pixel art"],
+                    ["studio", "Studio (draw)"],
                   ] as [MainTab, string][]
                 ).map(([k, label]) => (
                   <button
@@ -1162,7 +1183,7 @@ export function PixelLabPanel({ open, onClose, onAssetsChanged, projectAssets = 
                     role="tab"
                     className={`pixel-lab-tab ${tab === k ? "is-on" : ""}`}
                     onClick={() => setTab(k)}
-                    disabled={busy}
+                    disabled={busy && k !== "studio"}
                   >
                     {label}
                   </button>
@@ -1647,13 +1668,25 @@ export function PixelLabPanel({ open, onClose, onAssetsChanged, projectAssets = 
                 </>
               )}
 
-              {err && <p className="pixel-lab-err">{err}</p>}
-              {busy && (
+              <div
+                className="pixel-lab-studio-mount"
+                style={{ display: tab === "studio" ? "block" : "none" }}
+                aria-hidden={tab !== "studio"}
+              >
+                <PixelArtStudioContent
+                  active={open && tab === "studio"}
+                  onAssetsChanged={onAssetsChanged}
+                  projectAssets={projectAssets}
+                />
+              </div>
+
+              {err && tab !== "studio" && <p className="pixel-lab-err">{err}</p>}
+              {tab !== "studio" && busy && (
                 <p className="pixel-lab-status pixel-lab-status-working" aria-live="polite">
                   {statusLine || "Working…"}
                 </p>
               )}
-              {!busy && statusLine && <p className="pixel-lab-status">{statusLine}</p>}
+              {tab !== "studio" && !busy && statusLine && <p className="pixel-lab-status">{statusLine}</p>}
 
               <div className="pixel-lab-go">
                 {tab === "still" && (
@@ -1703,13 +1736,13 @@ export function PixelLabPanel({ open, onClose, onAssetsChanged, projectAssets = 
                 )}
               </div>
 
-              {lastPreview && (
+              {lastPreview && tab !== "studio" && (
                 <div className="pixel-lab-preview">
                   <img src={lastPreview} alt="Preview" className="pixel-lab-preview-img" />
                 </div>
               )}
 
-              {jsonDebug && (
+              {jsonDebug && tab !== "studio" && (
                 <details className="pixel-lab-json">
                   <summary>Response (debug)</summary>
                   <pre className="pixel-lab-pre">{jsonDebug}</pre>
